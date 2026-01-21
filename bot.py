@@ -1,72 +1,136 @@
-"""
-Пример бота с интерактивной клавиатурой для Max
-
-Этот бот отправляет сообщение с кнопками и обрабатывает нажатия на них.
-"""
-
 from maxgram import Bot
 from maxgram.keyboards import InlineKeyboard
+from config import TOKEN
 
-# Инициализация бота
-# Внимание! Рекомендуется через .env получать токен!
-bot = Bot("f9LHodD0cOJTtjGz_nLQlHs2b6j_MMBp1Kdb6egSNRFohzFBxRrN_C3k1Q-8NCcr5xnKBfdIyhIaJRhrWmnS")
+bot = Bot(TOKEN)
 
-# Создание клавиатуры
+print("🚀 MAX бот запущен (maxgram)")
+
+# Глобальная переменная для хранения состояния пользователя
+user_states = {}
+
+# ─────────────────────
+# КЛАВИАТУРА (ПРАВИЛЬНЫЙ ВЫЗОВ)
+# ─────────────────────
 main_keyboard = InlineKeyboard(
     [
-        {"text": "Отправить новое сообщение", "callback": "button1"},
-    ],
-    [ 
-        {"text": "Изменить сообщение", "callback": "button2"},
-        {"text": "Показать Назад", "callback": "button3"}
+        {"text": "📝 Создать анкету", "callback": "create"}
     ],
     [
-        {"text": "Открыть ссылку", "url": "https://pypi.org/project/maxgram/"}
+        {"text": "👤 Моя анкета", "callback": "profile"},
+        {"text": "🗑 Удалить анкету", "callback": "delete"}
     ]
 )
 
-# Обработчик события запуска бота
-@bot.on("bot_started")
-def on_start(context):
+# Клавиатура для выбора пола
+gender_keyboard = InlineKeyboard(
+    [
+        {"text": "🚹 Мужской", "callback": "male"},
+        {"text": "🚺 Женский", "callback": "female"}
+    ]
+)
+
+# ─────────────────────
+# КОМАНДЫ
+# ─────────────────────
+bot.set_my_commands({
+    "start": "Запустить бота",
+    "menu": "Показать меню"
+})
+
+# ─────────────────────
+# /start
+# ─────────────────────
+@bot.command("start")
+def start(context):
     context.reply(
-        "Привет! Я бот с клавиатурой. Нажми на одну из кнопок ниже:",
+        "👋 Привет! Это чат знакомств\n\n"
+        "Выбери действие 👇",
         keyboard=main_keyboard
     )
 
-# Отправить клавиатуру по команде '/keyboard'
-@bot.command("keyboard")
-def keyboard_command(context):
+# ─────────────────────
+# /menu
+# ─────────────────────
+@bot.command("menu")
+def menu(context):
     context.reply(
-        "Вот клавиатура. Выбери одну из опций:",
+        "📋 Главное меню",
         keyboard=main_keyboard
     )
 
-# Обработчик нажатий на кнопки
+# ─────────────────────
+# ОБРАБОТКА КНОПОК
+# ─────────────────────
 @bot.on("message_callback")
 def handle_callback(context):
-    
     button = context.payload
-    
-    if button == "button1":
-        context.reply_callback("Вы отправили новое сообщение")
-    elif button == "button2":
-        context.reply_callback("Вы изменили текущее сообщение", is_current=True)
-    elif button == "button3":
-        context.reply_callback("Вы изменили текущее сообщение с новой клавиатурой", 
-                          keyboard=InlineKeyboard(
-                              [{"text": "Вернуться к меню", "callback": "back_to_menu"}]
-                          ),
-                          is_current=True)
-    elif button == "back_to_menu":
+
+    if button == "create":
+        # Отправляем сообщение с запросом на ввод имени
+        context.reply(
+            "📝 Введите ваше имя:",
+        )
+        # Сохраняем состояние пользователя
+        user_states[context.chat_id] = "waiting_for_name"
+
+    elif button == "profile":
         context.reply_callback(
-            "Вернемся к основному меню", 
-            keyboard=main_keyboard,
+            "👤 Твоя анкета пока пустая",
             is_current=True
         )
 
-# Запуск бота
-if __name__ == "__main__":
-    try:
-        bot.run()
-    except KeyboardInterrupt:
-        bot.stop()
+    elif button == "delete":
+        context.reply_callback(
+            "🗑 Анкета удалена (заглушка)",
+            is_current=True
+        )
+
+    elif button == "male":
+        context.reply_callback(
+            "🚹 Пол выбран: Мужской",
+            is_current=True
+        )
+        # Обновляем состояние пользователя
+        user_states[context.chat_id]["gender"] = "male"
+        user_states[context.chat_id]["state"] = "waiting_for_age"
+
+    elif button == "female":
+        context.reply_callback(
+            "🚺 Пол выбран: Женский",
+            is_current=True
+        )
+        # Обновляем состояние пользователя
+        user_states[context.chat_id]["gender"] = "female"
+        user_states[context.chat_id]["state"] = "waiting_for_age"
+
+# ─────────────────────
+# ОБРАБОТКА СООБЩЕНИЙ
+# ─────────────────────
+@bot.on("message")
+def handle_message(context):
+    if user_states.get(context.chat_id) == "waiting_for_name":
+        name = context.message.text
+        context.reply(
+            f"👋 Привет, {name}! Теперь выберите ваш пол 👇",
+            keyboard=gender_keyboard
+        )
+        # Сохраняем имя пользователя
+        user_states[context.chat_id] = {"name": name}
+        # Обновляем состояние пользователя
+        user_states[context.chat_id]["state"] = "waiting_for_gender"
+
+    elif user_states.get(context.chat_id) == "waiting_for_age":
+        age = context.message.text
+        context.reply(
+            f"👶 Ваш возраст: {age}. Анкета создана (пока заглушка)."
+        )
+        # Сохраняем возраст пользователя
+        user_states[context.chat_id]["age"] = age
+        # Обновляем состояние пользователя
+        user_states[context.chat_id]["state"] = "profile_created"
+
+# ─────────────────────
+# ЗАПУСК
+# ─────────────────────
+bot.run()
