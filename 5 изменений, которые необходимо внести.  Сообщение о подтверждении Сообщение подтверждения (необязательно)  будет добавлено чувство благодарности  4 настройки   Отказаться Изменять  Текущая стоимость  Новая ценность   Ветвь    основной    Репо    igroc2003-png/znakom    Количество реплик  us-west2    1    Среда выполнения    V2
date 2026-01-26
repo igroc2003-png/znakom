@@ -1,6 +1,0 @@
-__pycache__/
-*.pyc
-profiles.db
-bot.log
-.env
-venv/
