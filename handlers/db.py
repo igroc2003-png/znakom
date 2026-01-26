@@ -4,8 +4,7 @@ from datetime import datetime
 DB_PATH = "profiles.db"
 GEO_DB = "geo.db"
 
-
-# ================== ПРОФИЛИ ==================
+# ================== PROFILES ==================
 
 def create_database():
     conn = sqlite3.connect(DB_PATH)
@@ -69,7 +68,7 @@ def delete_profile(user_id):
     conn.close()
 
 
-# ================== ЗОДИАК ==================
+# ================== ZODIAC ==================
 
 def get_zodiac(day, month):
     if (month == 1 and day >= 20) or (month == 2 and day <= 18): return "♒ Водолей"
@@ -86,14 +85,24 @@ def get_zodiac(day, month):
     return "♑ Козерог"
 
 
-# ================== ГОРОДА (GEO.DB) ==================
+# ================== GEO SEARCH ==================
 
-def find_cities(query: str, limit=10):
+def normalize_city(text: str):
+    text = text.strip()
+    if not text:
+        return ""
+    return text[0].upper() + text[1:].lower()
+
+
+def find_cities(prefix: str, limit=10):
     """
-    Поиск городов по русскому названию
+    Поиск С НАЧАЛА СЛОВА
+    Работает корректно с кириллицей
     """
-    if not query.strip():
+    if not prefix or len(prefix) < 2:
         return []
+
+    prefix = normalize_city(prefix)
 
     conn = sqlite3.connect(GEO_DB)
     cursor = conn.cursor()
@@ -102,27 +111,11 @@ def find_cities(query: str, limit=10):
         SELECT name
         FROM geo
         WHERE name LIKE ?
-        ORDER BY important DESC, name
+        ORDER BY important DESC, name ASC
         LIMIT ?
-    """, (f"%{query.strip()}%", limit))
+    """, (prefix + "%", limit))
 
     rows = [row[0] for row in cursor.fetchall()]
     conn.close()
+
     return rows
-
-
-def city_exists(city_name: str) -> bool:
-    """
-    Проверка существования города
-    """
-    conn = sqlite3.connect(GEO_DB)
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT 1 FROM geo WHERE name = ? LIMIT 1",
-        (city_name.strip(),)
-    )
-
-    exists = cursor.fetchone() is not None
-    conn.close()
-    return exists

@@ -53,7 +53,12 @@ def callbacks(ctx):
     elif payload == "delete":
         delete_profile(chat_id)
         users.pop(chat_id, None)
+
+        from handlers.profile import show_menu
+
         ctx.reply("🗑 Анкета удалена")
+        show_menu(ctx)
+
 
     elif payload == "edit":
         start_anketa(ctx)
@@ -65,10 +70,15 @@ def callbacks(ctx):
 
         # 👉 Возвращаем в главное меню
         from handlers.profile import main_menu
+        from handlers.db import get_profile
+
+        profile = get_profile(str(ctx.chat_id))
+
         ctx.reply(
             "Выбери действие 👇",
-            keyboard=main_menu(True)
-    )
+            keyboard=main_menu(profile)
+        )
+
 
     elif payload.startswith("city:"):
         city = payload.split("city:", 1)[1]

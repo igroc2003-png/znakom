@@ -6,19 +6,22 @@ logging.info("🚀 profile handlers загружены")
 
 # ================== КЛАВИАТУРЫ ==================
 
-def main_menu(has_profile: bool, gender=None):
-    """Главное меню с эмодзи у кнопки Анкета"""
-    if has_profile:
-        profile_emoji = "👤"
+def main_menu(profile):
+    if profile:
+        name, gender, *_ = profile
+
+        emoji = "👤"
         if gender == "М":
-            profile_emoji = "👨"
+            emoji = "👨"
         elif gender == "Ж":
-            profile_emoji = "👩"
+            emoji = "👩"
+
         return InlineKeyboard(
             [{"text": "⭐ VIP", "callback": "vip"}],
-            [{"text": f"{profile_emoji} Анкета", "callback": "open_profile"}],
-            [{"text": "🎯 Настроить фильтры", "callback": "filters"}],
+            [{"text": f"{emoji} Анкета", "callback": "open_profile"}],
+            [{"text": "🎯 Фильтры поиска", "callback": "filters"}],
             [{"text": "🎲 Рулетка", "callback": "roulette"}],
+            [{"text": "🤖 ChatGPT", "callback": "chatgpt"}],
         )
     else:
         return InlineKeyboard(
@@ -30,41 +33,45 @@ profile_menu = InlineKeyboard(
     [
         {"text": "✏️ Редактировать", "callback": "edit_profile"},
         {"text": "🗑 Удалить", "callback": "delete_profile"},
-        {"text": "⬅️ Назад", "callback": "back_to_menu"}
+        {"text": "⬅️ Назад", "callback": "back_to_menu"},
     ]
 )
 
-confirm_delete_menu = InlineKeyboard(
+delete_confirm_menu = InlineKeyboard(
     [
-        {"text": "✅ Да", "callback": "confirm_delete"},
-        {"text": "❌ Нет", "callback": "cancel_delete"},
+        {"text": "✅ Да, удалить", "callback": "confirm_delete"},
+        {"text": "❌ Нет", "callback": "back_to_menu"},
     ]
 )
 
+# ================== ОТОБРАЖЕНИЕ ==================
 
-# ================== ОСНОВНАЯ ЛОГИКА ==================
+def show_menu(ctx):
+    profile = get_profile(str(ctx.chat_id))
 
-def show_main_menu(ctx):
-    """Главное меню"""
-    user_id = str(ctx.chat_id)
-    profile = get_profile(user_id)
-    gender = profile[1] if profile else None
-    ctx.reply("Главное меню:" if profile else
-              "👋 ❤️🔍🎲 Привет! Это Чат-рулетка знакомств 👫\n\nВыбери действие 👇",
-              keyboard=main_menu(bool(profile), gender))
-
-
-def view_profile(ctx):
-    """Просмотр анкеты с эмодзи по полу"""
-    user_id = str(ctx.chat_id)
-    profile = get_profile(user_id)
     if not profile:
-        # если анкеты нет — создаем
-        from handlers.anketa import start_anketa
-        start_anketa(ctx)
+        ctx.reply(
+            "👋 ❤️🔍🎲 Привет! Это Чат-рулетка знакомств 👫\n\n"
+            "Выбери действие 👇",
+            keyboard=main_menu(None)
+        )
+        return
+
+    ctx.reply(
+        "Выбери действие 👇",
+        keyboard=main_menu(profile)
+    )
+
+
+def show_profile(ctx):
+    profile = get_profile(str(ctx.chat_id))
+
+    if not profile:
+        show_menu(ctx)
         return
 
     name, gender, birthdate, age, zodiac, city, about, photo = profile
+
     emoji = "👤"
     if gender == "М":
         emoji = "👨"
@@ -81,29 +88,30 @@ def view_profile(ctx):
         f"🏙 Город: {city}\n"
         f"✍️ О себе: {about}\n"
     )
+
     if photo:
-        text += f"\n📸 Фото прикреплено: {photo}"
+        text += f"\n📸 Фото: {photo}"
 
     ctx.reply(text, keyboard=profile_menu)
 
-
-# ================== РЕГИСТРАЦИЯ HANDLERS ==================
+# ================== HANDLERS ==================
 
 def register_profile_handlers(bot):
 
     @bot.command("start")
     def start(ctx):
-        show_main_menu(ctx)
+        show_menu(ctx)
 
     @bot.on("message_callback")
     def callbacks(ctx):
         payload = ctx.payload
+        user_id = str(ctx.chat_id)
 
         if payload == "open_profile":
-            view_profile(ctx)
+            show_profile(ctx)
 
         elif payload == "back_to_menu":
-            show_main_menu(ctx)
+            show_menu(ctx)
 
         elif payload == "create_profile":
             from handlers.anketa import start_anketa
@@ -115,23 +123,21 @@ def register_profile_handlers(bot):
 
         elif payload == "delete_profile":
             ctx.reply(
-                "⚠️ Вы уверены, что хотите удалить анкету?",
-                keyboard=confirm_delete_menu
+                "⚠️ Ты уверен, что хочешь удалить анкету?",
+                keyboard=delete_confirm_menu
             )
 
         elif payload == "confirm_delete":
-            delete_profile(str(ctx.chat_id))
+            delete_profile(user_id)
             ctx.reply(
                 "🗑 Анкета удалена",
-                keyboard=main_menu(False)
+                keyboard=main_menu(None)
             )
 
-        elif payload == "cancel_delete":
-            profile = get_profile(str(ctx.chat_id))
+        elif payload == "chatgpt":
             ctx.reply(
-                "Удаление отменено 👌",
-                keyboard=main_menu(bool(profile))
+                "🤖 ChatGPT скоро будет доступен 😉\n"
+                "Функция в разработке."
             )
-
 
     logging.info("✅ profile handlers зарегистрированы")
