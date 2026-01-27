@@ -1,3 +1,4 @@
 import os
 
-TOKEN = os.getenv("BOT_TOKEN")  # теперь работает
+TOKEN = os.getenv("TOKEN")  # теперь работает
+
