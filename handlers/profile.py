@@ -27,10 +27,9 @@ def main_menu(profile):
             [{"text": "🎯 Фильтры поиска", "callback": "filters"}],
             [{"text": "🎲 Рулетка", "callback": "roulette"}],
         )
-    else:
-        return InlineKeyboard(
-            [{"text": "📝 Создать анкету", "callback": "create_profile"}]
-        )
+
+    # Если анкета нет — показываем только кнопку Создать анкету
+    return InlineKeyboard([{"text": "📝 Создать анкету", "callback": "create_profile"}])
 
 
 profile_menu = InlineKeyboard(
@@ -54,19 +53,10 @@ def show_menu(ctx):
     """
     Отображает главное меню пользователю.
     """
-    profile = get_profile(str(ctx.chat_id))
-
-    if not profile:
-        ctx.reply(
-            "👋 ❤️🔍🎲 Привет! Это Чат-рулетка знакомств 👫\n\n"
-            "Выбери действие 👇",
-            keyboard=main_menu(None)
-        )
-        return
-
+    profile_data = get_profile(str(ctx.chat_id))
     ctx.reply(
-        "Выбери действие 👇",
-        keyboard=main_menu(profile)
+        "👋 ❤️🔍🎲 Привет! Это Чат-рулетка знакомств 👫\n\nВыбери действие 👇",
+        keyboard=main_menu(profile_data)
     )
 
 
@@ -109,13 +99,8 @@ def show_profile(ctx):
 
 def register_profile_handlers(bot):
     """
-    Регистрирует обработчики команд и callback'ов для профиля.
+    Регистрирует обработчики callback'ов для профиля.
     """
-
-    @bot.command("start")
-    def start(ctx):
-        show_menu(ctx)
-
     @bot.on("message_callback")
     def callbacks(ctx):
         payload = ctx.payload
@@ -149,5 +134,6 @@ def register_profile_handlers(bot):
             )
 
     logging.info("✅ profile handlers зарегистрированы")
+
 
 
