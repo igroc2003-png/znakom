@@ -28,13 +28,11 @@ logging.info("✅ anketa handlers зарегистрированы")
 logging.info("✅ Все handlers зарегистрированы")
 
 # ================== СТАРТ ==================
-# Используем show_menu(ctx), чтобы main_menu сама выбирала правильный вид клавиатуры
 @bot.command("start")
 def start(ctx):
-    profile.show_menu(ctx)
+    from handlers.profile import show_menu
+    show_menu(ctx)  # напрямую вызываем show_menu, дублирования нет
 
 # ================== ЗАПУСК БОТА ==================
 logging.info("🚀 Запуск бота")
 bot.run()
-
-
