@@ -7,6 +7,11 @@ logging.info("🚀 profile handlers загружены")
 # ================== КЛАВИАТУРЫ ==================
 
 def main_menu(profile):
+    """
+    Возвращает клавиатуру главного меню.
+    Если profile есть — показываем VIP, Анкету, Фильтры, Рулетку.
+    Если нет — показываем кнопку Создать анкету.
+    """
     if profile:
         name, gender, *_ = profile
 
@@ -21,7 +26,6 @@ def main_menu(profile):
             [{"text": f"{emoji} Анкета", "callback": "open_profile"}],
             [{"text": "🎯 Фильтры поиска", "callback": "filters"}],
             [{"text": "🎲 Рулетка", "callback": "roulette"}],
-            #[{"text": "🤖 ChatGPT", "callback": "chatgpt"}],
         )
     else:
         return InlineKeyboard(
@@ -47,6 +51,9 @@ delete_confirm_menu = InlineKeyboard(
 # ================== ОТОБРАЖЕНИЕ ==================
 
 def show_menu(ctx):
+    """
+    Отображает главное меню пользователю.
+    """
     profile = get_profile(str(ctx.chat_id))
 
     if not profile:
@@ -64,6 +71,9 @@ def show_menu(ctx):
 
 
 def show_profile(ctx):
+    """
+    Показывает анкету пользователя.
+    """
     profile = get_profile(str(ctx.chat_id))
 
     if not profile:
@@ -94,9 +104,13 @@ def show_profile(ctx):
 
     ctx.reply(text, keyboard=profile_menu)
 
+
 # ================== HANDLERS ==================
 
 def register_profile_handlers(bot):
+    """
+    Регистрирует обработчики команд и callback'ов для профиля.
+    """
 
     @bot.command("start")
     def start(ctx):
@@ -134,11 +148,6 @@ def register_profile_handlers(bot):
                 keyboard=main_menu(None)
             )
 
-        elif payload == "chatgpt":
-            ctx.reply(
-                "🤖 ChatGPT скоро будет доступен 😉\n"
-                "Функция в разработке."
-            )
-
     logging.info("✅ profile handlers зарегистрированы")
+
 
