@@ -21,7 +21,7 @@ def main_menu(profile):
             [{"text": f"{emoji} Анкета", "callback": "open_profile"}],
             [{"text": "🎯 Фильтры поиска", "callback": "filters"}],
             [{"text": "🎲 Рулетка", "callback": "roulette"}],
-            [{"text": "🤖 ChatGPT", "callback": "chatgpt"}],
+            #[{"text": "🤖 ChatGPT", "callback": "chatgpt"}],
         )
     else:
         return InlineKeyboard(
@@ -141,3 +141,4 @@ def register_profile_handlers(bot):
             )
 
     logging.info("✅ profile handlers зарегистрированы")
+
