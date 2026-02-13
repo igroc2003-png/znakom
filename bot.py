@@ -10,7 +10,7 @@ import hashlib
 import urllib.parse
 import sys
 import subprocess
-from payment import create_payment_link
+#from payment import create_payment_link
 
 # ================== ЛОГИ ==================
 
