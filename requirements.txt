@@ -1,4 +1,2 @@
 maxgram
-aiohttp
 flask
-
