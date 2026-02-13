@@ -5,11 +5,12 @@ import time
 from datetime import datetime
 from maxgram import Bot
 from maxgram.keyboards import InlineKeyboard
-from config import TOKEN, ADMIN_ID, SUPPORT_URL, ROBO_MERCHANT_LOGIN, ROBO_PASS1, ROBO_PASS2, ROBO_TEST
+from config import TOKEN, ADMIN_ID, SUPPORT_URL, IM_ESHOP_ID, IM_SECRET_KEY, IM_TEST
 import hashlib
 import urllib.parse
 import sys
 import subprocess
+from payment import create_payment_link
 
 # ================== ЛОГИ ==================
 
@@ -363,7 +364,18 @@ def create_db():
     conn.commit()
     conn.close()
  
+#Удаление анкеты через 30 дней
+def delete_expired_profiles():
+    now = datetime.now().timestamp()
 
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM profiles WHERE deleted_at IS NOT NULL AND deleted_at <= ?",
+        (now,)
+    )
+    conn.commit()
+    conn.close()
 
  
 def update_filter(user_id, field, value):
@@ -425,11 +437,17 @@ def save_profile(user_id, data):
 
 #пометка удаления    
 def soft_delete_profile(user_id):
+    delete_date = datetime.now().timestamp() + 30 * 24 * 60 * 60  # +30 дней в секундах
+
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("UPDATE profiles SET deleted_at = ? WHERE user_id = ?", (datetime.now(), user_id))
+    cursor.execute(
+        "UPDATE profiles SET deleted_at = ? WHERE user_id = ?",
+        (delete_date, user_id)
+    )
     conn.commit()
-    conn.close()    
+    conn.close()
+  
 
 # ================== УНИВЕРСАЛЬНЫЙ ВЫБОР ГОРОДА ==================
 def send_city_selection(ctx, text, limit=5):
@@ -493,18 +511,20 @@ def find_cities(prefix, limit=10):
 
 # ================== ОБРАБОТКА ПРОФИЛЯ ==================
 def show_profile(ctx, profile, keyboard):
-      emoji = "👨" if profile.get("gender") == "М" else "👩"
-      text = (
-          f"{emoji} Ваша анкета:\n\n"
-          f"Имя: {profile.get('name')}\n"
-          f"Пол: {profile.get('gender')}\n"
-          f"🎂 Дата рождения: {profile.get('birthdate')}\n"
-          f"🎈 Возраст: {profile.get('age')}\n"
-          f"🏙 Город: {profile.get('city')}\n"
-          f"✍️ О себе: {profile.get('about')}\n\n"
-          f"📸 Фото:\n{profile.get('photo_url')}"
-      )
-      ctx.reply(text, keyboard=keyboard)
+    emoji = "👨" if profile.get("gender") == "М" else "👩"
+    text = (
+        f"{emoji} Ваша анкета:\n\n"
+        f"Имя: {profile.get('name')}\n"
+        f"Пол: {profile.get('gender')}\n"
+        f"🎂 Дата рождения: {profile.get('birthdate')}\n"
+        f"🎈 Возраст: {profile.get('age')}\n"
+        f"🏙 Город: {profile.get('city')}\n"
+        f"✍️ О себе: {profile.get('about')}\n\n"
+        f"💎 VIP: {'да' if profile.get('is_vip') else 'нет'}\n"
+        f"📸 Фото:\n{profile.get('photo_url')}"
+    )
+    
+    ctx.reply(text, keyboard=keyboard)
 
 def show_filters(ctx):
       profile = get_profile(ctx.chat_id)
@@ -535,25 +555,6 @@ def show_filters(ctx):
 
 
 
-
-def robokassa_link(user_id: str, amount: int, days: int):
-
-    inv_id = f"{user_id}_{days}_{int(time.time())}"
-
-    sign_string = f"{ROBO_MERCHANT_LOGIN}:{amount}:{inv_id}:{ROBO_PASS1}"
-    signature = hashlib.md5(sign_string.encode()).hexdigest().upper()
-
-    params = {
-        "MerchantLogin": ROBO_MERCHANT_LOGIN,
-        "OutSum": amount,
-        "InvId": inv_id,
-        "Description": f"VIP подписка {days} дней",
-        "SignatureValue": signature,
-        "IsTest": 1 if ROBO_TEST else 0
-    }
-
-    base_url = "https://auth.robokassa.ru/Merchant/Index.aspx?"
-    return base_url + urllib.parse.urlencode(params)
 
 
 
@@ -615,7 +616,7 @@ def auto_leave_if_non_vip(user_id, partner_id):
     if profile is None or partner_profile is None:
         return
 
-    if not profile.get("is_vip") and not partner_profile.get("is_vip"):
+    if not is_vip(profile) and not partner_is_vip(profile):
         if user_id in active_chats and active_chats[user_id] == partner_id:
             del active_chats[user_id]
             del active_chats[partner_id]
@@ -626,7 +627,47 @@ def auto_leave_if_non_vip(user_id, partner_id):
             if p_ctx:
                 p_ctx.reply("Время истекло. Оба участника не имеют VIP-статус, поэтому чат автоматически закрыт.")
 
+ 
+
+
+
+
+def intellectmoney_link(order_id: str, amount: float, client_email: str) -> str:
+    """
+    Генерация ссылки для выставления счета через IntellectMoney.
         
+    :param order_id: Внутренний номер заказа
+    :param amount: Сумма в рублях (1 – 3 500 000)
+    :param client_email: Email пользователя
+    :return: Ссылка на оплату
+    """
+    # Проверка диапазона суммы
+    if amount < 1 or amount > 3500000:
+        raise ValueError("Сумма оплаты должна быть от 1 до 3 500 000 ₽")
+
+    base_url = "https://merchant.intellectmoney.ru/"
+    params = {
+        "eshopId": IM_ESHOP_ID,       # обязательно
+        "orderId": order_id,          # внутренний номер заказа
+        "recipientAmount": f"{amount:.2f}",  # обязательно!
+        "recipientCurrency": "RUB",   # валюта
+        "ClientEmail": client_email,
+        "TestMode": 1                 # 1 — тест, 0 — реальный платеж
+    }
+
+    query_string = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
+    return f"{base_url}?{query_string}"
+
+
+
+
+
+
+
+
+
+
+ 
 # ================== ОБРАБОТКА ВВОДА ГОРОДА ==================
 @bot.on("message_created")
 def relay(ctx):
@@ -635,7 +676,7 @@ def relay(ctx):
 	
 	# Сначала обрабатываем шаги анкеты
     text_steps(ctx)
-    city_input(ctx)
+    
 
     # ❗ Если это callback — выходим
     if ctx.payload:
@@ -654,25 +695,6 @@ def relay(ctx):
 
     if partner_id in contexts:
         contexts[partner_id].reply(text)
-
-def city_input(ctx):
-    chat_id = str(ctx.chat_id)
-    u = users.get(chat_id)
-    if not u:
-        return
-
-    if u.get("step") != "city_search":
-        return
-
-    text = ctx.message.get("text")
-    if not text and "body" in ctx.message:
-        text = ctx.message["body"].get("text")
-    if not text:
-        return
-
-    query = text.strip()
-    send_city_selection(ctx, query)
-
 
 # ================== ЗОДИАК ==================
 def get_zodiac(day, month):
@@ -760,34 +782,31 @@ def text_steps(ctx):
             u["step"] = "edit"
             ctx.reply("Дата рождения обновлена ✅", keyboard=edit_keyboard)
         else:
-            u["step"] = "city"
+            u["step"] = "city_search"
+            u["city_mode"] = "profile_create"
             ctx.reply("Введите первые буквы города:")
         return
 
         
-    # -------- Город --------
-    if step == "city":
+# -------- Город --------
+    if step == "city_search":
         if len(text) < 2:
             ctx.reply("Введите минимум 2 символа")
             return
 
-        cities = find_cities(text)
-        if not cities:
-            ctx.reply("Города не найдены, попробуйте ещё")
-            return
-
-        kb_rows = []
-        for name, region in cities:
-            kb_rows.append([{
-                "text": f"{name} ({region})",
-                "callback": f"profile_city:{name}|{region}"
-            }])
-
-        kb = InlineKeyboard(*kb_rows)
-        ctx.reply("Выберите город:", keyboard=kb)
-        return  # 🔥 ВАЖНО
+        send_city_selection(ctx, text)
+        return
 
 
+
+           
+   
+
+    
+    
+    
+    
+    
     # -------- Обо мне --------
     if step == "about":
         if not text:
@@ -852,12 +871,8 @@ def text_steps(ctx):
 
 
 
-
-
-
-
 # ================== СТАРТ ==================
-@bot.command("start")
+@bot.on("bot_started")
 def start(ctx):
     chat_id = str(ctx.chat_id)
     profile = get_profile(chat_id)
@@ -902,31 +917,51 @@ def handle_callback(ctx):
     # Обрабатываем колбэки
     if ctx.payload == "vip_30":
         tariff_price = 300
-        link = robokassa_link(chat_id, tariff_price, 30)
+        link = intellectmoney_link(
+            order_id=str(chat_id),
+            amount=tariff_price,
+            client_email="email@address.com"  # тут можно динамически подставлять email пользователя
+        )
         reply_text = f"Вы выбрали тариф \"VIP 30 дней\" стоимостью {tariff_price} рублей."
         reply_keyboard = InlineKeyboard(
             [{"text": "💳 Оплатить", "url": link}],
             [{"text": "Отмена", "callback": "back"}]
         )
         ctx.reply(reply_text, keyboard=reply_keyboard)
+
     elif ctx.payload == "vip_180":
         tariff_price = 1500
-        link = robokassa_link(str(chat_id), tariff_price, 180)
-        reply_text = f"Вы выбрали тариф \"VIP 6 месяцев\" стоимостью {tariff_price} рублей."
+        order_id = f"{chat_id}_{int(time.time())}"
+        client_email = "email@address.com"  # сюда можешь подставить реальный email
+        link = intellectmoney_link(
+            order_id=order_id,
+            amount=tariff_price,
+            client_email=client_email
+        )
+        reply_text = f'Вы выбрали тариф "VIP 6 месяцев" стоимостью {tariff_price} рублей.'
         reply_keyboard = InlineKeyboard(
             [{"text": "💳 Оплатить", "url": link}],
             [{"text": "Отмена", "callback": "back"}]
         )
         ctx.reply(reply_text, keyboard=reply_keyboard)
+
+
     elif ctx.payload == "vip_365":
         tariff_price = 2500
-        link = robokassa_link(str(chat_id), tariff_price, 365)
-        reply_text = f"Вы выбрали тариф \"VIP 12 месяцев\" стоимостью {tariff_price} рублей."
+        order_id = f"{chat_id}_{int(time.time())}"
+        client_email = "email@address.com"
+        link = intellectmoney_link(
+            order_id=order_id,
+            amount=tariff_price,
+            client_email=client_email
+        )
+        reply_text = f'Вы выбрали тариф "VIP 12 месяцев" стоимостью {tariff_price} рублей.'
         reply_keyboard = InlineKeyboard(
             [{"text": "💳 Оплатить", "url": link}],
             [{"text": "Отмена", "callback": "back"}]
         )
         ctx.reply(reply_text, keyboard=reply_keyboard)
+
     elif ctx.payload == "start_buh":
         subprocess.Popen(["python", "buh.py"])
         ctx.reply("✅ BUH запущен!")
@@ -961,9 +996,10 @@ def handle_callback(ctx):
         max_age = profile.get("filters_age_max", MAX_AGE_LIMIT)
         ctx.reply("Выберите возраст для фильтров:", keyboard=age_keyboard_filters(min_age, max_age))
     elif ctx.payload == "city_filters":
-        # Выбор города
-        users[chat_id]["step"] = "city_search"
-        ctx.reply("Введите первые 2 символа города:")
+        # Выбор города фильтр
+        u["step"] = "city_search"
+        u["city_mode"] = "filters"
+        ctx.reply("Введите первые буквы города для фильтра:")
     elif ctx.payload == "done_filters":
         # Завершаем установку фильтров
         ctx.reply("Фильтры сохранены ✅", keyboard=main_menu(get_profile(chat_id)))
@@ -1023,15 +1059,68 @@ def handle_callback(ctx):
         u["gender"] = "Ж"
         u["step"] = "birth_day"
         ctx.reply("Введите день рождения (1–31):")
-#    elif ctx.payload.startswith("city_selected:"):
-#        # Пользователь выбрал город
-#        parts = ctx.payload.split(":")[1:]
-#        city_name = "_".join(parts[:-1]).replace("_", " ")
-#        region = parts[-1].replace("_", " ")
-#        u["city"] = city_name
-#        u["region"] = region
-#        u["step"] = "about"
-#        ctx.reply(f"🏙 Город выбран: {city_name} ({region}).\nРасскажите немного о себе:")
+    elif ctx.payload.startswith("city_selected:"):
+        # === ВЫБОР ГОРОДА ===
+        _, city_data = ctx.payload.split(":", 1)
+        city, region = city_data.split("|")
+
+        mode = u.get("city_mode")
+
+        # === СОЗДАНИЕ АНКЕТЫ ===
+        if mode == "profile_create":
+            u["city"] = city
+            u["region"] = region
+            u["step"] = "about"
+            u["city_mode"] = None
+
+            ctx.reply(
+                f"🏙 Город выбран: {city} ({region})\n\n"
+                "Расскажите немного о себе:"
+            )
+            return
+
+        # === РЕДАКТИРОВАНИЕ ПРОФИЛЯ ===
+        if mode == "profile_edit":
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE profiles SET city=?, region=? WHERE user_id=?",
+                (city, region, chat_id)
+            )
+            conn.commit()
+            conn.close()
+
+            u["city_mode"] = None
+            ctx.reply(f"🏙 Город обновлён: {city} ({region})", keyboard=edit_keyboard)
+            return
+
+        # === ФИЛЬТРЫ ===
+        if mode == "filters":
+            update_filter(chat_id, "filters_city", city)
+            update_filter(chat_id, "filters_region", region)
+
+            u["city_mode"] = None
+            u["step"] = None
+
+            ctx.reply(
+                f"🏙 Фильтр города установлен: {city}",
+                keyboard=keyboard_filters(get_profile(chat_id))
+            )
+            return
+
+
+
+
+
+    elif ctx.payload == "edit_city":
+        # Редактирование города
+        u["step"] = "city_search"
+        u["city_mode"] = "profile_edit"
+        ctx.reply("Введите первые буквы нового города:")
+
+   
+
+
     elif ctx.payload == "delete":
         # Пользователь хочет удалить профиль
         ctx.reply("Вы уверены, что хотите удалить анкету?", keyboard=delete_confirm_keyboard)
@@ -1042,13 +1131,37 @@ def handle_callback(ctx):
         # Пользователь сохраняет профиль
         save_profile(chat_id, u)
         ctx.reply("Профиль успешно сохранён!", keyboard=main_menu(get_profile(chat_id)))
+    
+    
     elif ctx.payload == "delete_profile":
         # Пользователь хочет удалить профиль
-        ctx.reply("Вы уверены, что хотите удалить анкету?", keyboard=delete_confirm_keyboard)
+        ctx.reply(
+            "Анкета будет удалена через 30 дней.\n\n"
+            "Вы уверены, что хотите удалить анкету?",
+            keyboard=delete_confirm_keyboard
+        )
+
+    elif ctx.payload == "done_edit":
+        # Сохраняем изменения и показываем меню редактирования
+        save_profile(chat_id, u)  # сохраняем текущие данные пользователя
+        ctx.reply("Изменения сохранены!", keyboard=edit_keyboard)  # показываем клавиатуру редактирования
+   
+    
+    
+
     elif ctx.payload == "confirm_delete":
-        # Пользователь подтверждает удаление профиля
+        # Помечаем профиль на удаление
         soft_delete_profile(chat_id)
-        ctx.reply("Анкета будет удалена через 30 дней.", keyboard=age_keyboard)
+
+        # Получаем профиль заново
+        profile = get_profile(chat_id)
+
+        # Отправляем сообщение о пометке на удаление с клавиатурой восстановления
+        ctx.reply(
+            "⚠️ Ваша анкета помечена на удаление. Восстановить?", 
+            keyboard=restore_keyboard
+        )
+
     elif ctx.payload == "cancel_delete":
         # Пользователь отменяет удаление профиля
         ctx.reply("Удаление отменено.", keyboard=main_menu(get_profile(chat_id)))
@@ -1085,10 +1198,6 @@ def handle_callback(ctx):
         # Редактирование даты рождения
         u["step"] = "edit_birthdate"
         ctx.reply("Введите день рождения (1–31):")
-    elif ctx.payload == "edit_city":
-        # Редактирование города
-        u["step"] = "edit_city"
-        ctx.reply("Введите новый город проживания:")
     elif ctx.payload == "edit_photo":
         # Редактирование фотографии
         u["step"] = "edit_photo"
@@ -1123,16 +1232,32 @@ def handle_callback(ctx):
     elif ctx.payload == "vip_tariv":
         # Просмотр тарифов VIP
         ctx.reply("💎 Выберите тариф для подписки", keyboard=vip_keyboard)
+    
+    
+    
     elif ctx.payload == "restore_profile":
-        # Восстанавливаем профиль
         profile = get_profile(chat_id)
         if profile.get("deleted_at"):
-            ctx.reply("Ваша анкета восстановлена!", keyboard=main_menu(profile))
+            # Снимаем пометку удаления
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE profiles SET deleted_at=NULL WHERE user_id=?", (chat_id,))
+            conn.commit()
+            conn.close()
+
+            ctx.reply("♻ Ваша анкета восстановлена!", keyboard=main_menu(profile))
         else:
-            ctx.reply("Анкета не была удалена или уже восстановлена.")
+            ctx.reply("Анкета не была удалена или уже восстановлена.", keyboard=main_menu(profile))
+
+
     elif ctx.payload == "cancel_restore":
-        # Отказываемся восстанавливать профиль
-        ctx.reply("Восстанавливать профиль не будем.", keyboard=main_menu(get_profile(chat_id)))
+        # Пользователь отказался восстановить
+        ctx.reply("❌ Анкета не восстановлена.", keyboard=restore_keyboard)
+
+    
+    
+    
+    
     elif ctx.payload == "roulette":
         # Рулетка
         roulette(ctx)
@@ -1406,25 +1531,9 @@ def stop_buh(ctx):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # Главная функция старта
 if __name__ == "__main__":
     log.info("🚀 Bot started")
     create_db()  # создаем таблицу, если её нет
+    delete_expired_profiles()
     bot.run()
