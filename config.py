@@ -1,5 +1,5 @@
-
-
+import os
+TOKEN = os.getenv("BOT_TOKEN")
 # ================== DATABASE ==================
 DB_PATH = "profiles.db"
 GEO_DB = "geo.db"
@@ -26,6 +26,7 @@ ROBO_MERCHANT_LOGIN = "ipmav"
 ROBO_PASS1 = "Qazwsxedc1"
 ROBO_PASS2 = "Qazwsxedc2"
 ROBO_TEST = 1  # 1 для тестирования, 0 для реального использования
+
 
 
 
