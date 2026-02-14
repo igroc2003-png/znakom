@@ -186,12 +186,7 @@ OFFER_TEXT = """
 """
 
 
-# Клавиатура оферты
 
-vip_offer_keyboard = InlineKeyboard(
-    [{"text": "✅ Согласен", "callback": "offer_accept"}],
-    [{"text": "❌ Не согласен", "callback": "offer_decline"}]
-)
 
  
 
@@ -363,10 +358,25 @@ def create_db():
     """)
     conn.commit()
     conn.close()
+    
+def get_admin_stats():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) FROM profiles")
+    total_users = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM profiles WHERE is_vip=1")
+    vip_users = cursor.fetchone()[0]
+
+    conn.close()
+
+    return total_users, vip_users
+
  
 #Удаление анкеты через 30 дней
 def delete_expired_profiles():
-    now = datetime.now().timestamp()
+    now = int(time.time())
 
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -395,6 +405,30 @@ def delete_profile(user_id):
     cursor.execute("DELETE FROM profiles WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
+
+def activate_vip(user_id, days=3650):
+    vip_until = int(time.time()) + days * 24 * 60 * 60
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE profiles SET is_vip=1, vip_until=? WHERE user_id=?",
+        (vip_until, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_vip(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE profiles SET is_vip=0, vip_until=NULL WHERE user_id=?",
+        (user_id,)
+    )
+    conn.commit()
+    conn.close()
+
 
 # Получить профиль пользователя
 def get_profile(user_id):
@@ -519,7 +553,7 @@ def show_profile(ctx, profile, keyboard):
         f"🎂 Дата рождения: {profile.get('birthdate')}\n"
         f"🎈 Возраст: {profile.get('age')}\n"
         f"🏙 Город: {profile.get('city')}\n"
-        f"✍️ О себе: {profile.get('about')}\n\n"
+        f"✍️ О себе: {profile.get('about')}\n"
         f"💎 VIP: {'да' if profile.get('is_vip') else 'нет'}\n"
         f"📸 Фото:\n{profile.get('photo_url')}"
     )
@@ -555,6 +589,16 @@ def show_filters(ctx):
 
 
 
+def vip_active(profile):
+    if not profile:
+        return False
+
+    vip_until = profile.get("vip_until")
+
+    if not vip_until:
+        return False
+
+    return vip_until > int(time.time())
 
 
 
@@ -567,13 +611,12 @@ def is_vip(profile):
         return False
 
     vip_until = profile.get("vip_until")
+
     if not vip_until:
         return False
 
-    if vip_until > int(time.time()):
-        return True
+    return vip_until > int(time.time())
 
-    return False
 
 
 def chat_timer(u1, u2):
@@ -616,7 +659,7 @@ def auto_leave_if_non_vip(user_id, partner_id):
     if profile is None or partner_profile is None:
         return
 
-    if not is_vip(profile) and not partner_is_vip(profile):
+    if not is_vip(profile) and not is_vip(partner_profile):
         if user_id in active_chats and active_chats[user_id] == partner_id:
             del active_chats[user_id]
             del active_chats[partner_id]
@@ -628,6 +671,7 @@ def auto_leave_if_non_vip(user_id, partner_id):
                 p_ctx.reply("Время истекло. Оба участника не имеют VIP-статус, поэтому чат автоматически закрыт.")
 
  
+
 
 
 
@@ -652,7 +696,7 @@ def intellectmoney_link(order_id: str, amount: float, client_email: str) -> str:
         "recipientAmount": f"{amount:.2f}",  # обязательно!
         "recipientCurrency": "RUB",   # валюта
         "ClientEmail": client_email,
-        "TestMode": 1                 # 1 — тест, 0 — реальный платеж
+        "TestMode": IM_TEST           # 1 — тест, 0 — реальный платеж
     }
 
     query_string = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
@@ -859,6 +903,57 @@ def text_steps(ctx):
 
 
 
+    if ctx.payload == "vip_menu":
+
+        profile = get_profile(chat_id)
+
+        if vip_active(profile):
+            text = (
+                "💎 *VIP активен*\n\n"
+                f"Действует до: {profile.vip_until.strftime('%d.%m.%Y %H:%M')}"
+            )
+        else:
+            text = (
+                "💎 *VIP подписка*\n\n"
+                "Преимущества:\n"
+                "✔ Безлимитные чаты\n"
+                "✔ Нет авто-закрытия\n"
+                "✔ Приоритет в поиске\n\n"
+                "Выберите тариф 👇"
+            )
+
+        keyboard = InlineKeyboard(
+            [{"text": "💎 30 дней — 300 ₽", "callback": "vip_30"}],
+            [{"text": "💎 90 дней — 800 ₽", "callback": "vip_90"}],
+            [{"text": "⬅ Назад", "callback": "back"}]
+        )
+
+        ctx.reply(text, keyboard=keyboard, parse_mode="Markdown")
+
+
+
+  
+
+
+
+    if ctx.text.startswith("/givevip") and chat_id == ADMIN_ID:
+        try:
+            user_id = int(ctx.text.split()[1])
+            days = int(ctx.text.split()[2])
+            activate_vip(user_id, days)
+            ctx.reply(f"VIP выдан пользователю {user_id} на {days} дней")
+        except:
+            ctx.reply("Использование: /givevip user_id дни")
+
+
+    if ctx.text.startswith("/removevip") and chat_id == ADMIN_ID:
+        try:
+            user_id = int(ctx.text.split()[1])
+            remove_vip(user_id)
+            ctx.reply(f"VIP удалён у пользователя {user_id}")
+        except:
+            ctx.reply("Использование: /removevip user_id")
+
 
 
 
@@ -916,18 +1011,31 @@ def handle_callback(ctx):
 
     # Обрабатываем колбэки
     if ctx.payload == "vip_30":
+        profile = get_profile(chat_id)
+        if vip_active(profile):
+            ctx.reply("💎 VIP уже активен")
+            return
         tariff_price = 300
+        order_id = f"{chat_id}_{int(time.time())}"
         link = intellectmoney_link(
-            order_id=str(chat_id),
+            order_id=order_id,
             amount=tariff_price,
-            client_email="email@address.com"  # тут можно динамически подставлять email пользователя
+            client_email="email@address.com"
         )
-        reply_text = f"Вы выбрали тариф \"VIP 30 дней\" стоимостью {tariff_price} рублей."
-        reply_keyboard = InlineKeyboard(
-            [{"text": "💳 Оплатить", "url": link}],
-            [{"text": "Отмена", "callback": "back"}]
+        ctx.reply(
+            "💎 VIP 30 дней\n"
+            f"Стоимость: {tariff_price} ₽\n"
+            "Выберите способ оплаты 👇",
+            keyboard=InlineKeyboard(
+                [{"text": "💳 Банковская карта (IntellectMoney)", "url": link}],
+                [{"text": "💳 Банковская карта", "url": link}],
+                [{"text": "🟣 ЮMoney", "url": link}],
+                [{"text": "⚡ СБП", "url": link}],
+                [{"text": "🟢 SberPay", "url": link}],
+                [{"text": "❌ Отмена", "callback": "back"}]
+            )
         )
-        ctx.reply(reply_text, keyboard=reply_keyboard)
+
 
     elif ctx.payload == "vip_180":
         tariff_price = 1500
@@ -962,13 +1070,7 @@ def handle_callback(ctx):
         )
         ctx.reply(reply_text, keyboard=reply_keyboard)
 
-    elif ctx.payload == "start_buh":
-        subprocess.Popen(["python", "buh.py"])
-        ctx.reply("✅ BUH запущен!")
 
-    elif ctx.payload == "stop_buh":
-        subprocess.Popen(["taskkill", "/F", "/IM", "python.exe"])
-        ctx.reply("⛔ BUH остановлен!")
 
     elif ctx.payload == "open_profile":
         # Показываем профиль пользователя
@@ -977,12 +1079,75 @@ def handle_callback(ctx):
             ctx.reply("Анкета не найдена")
             return
         show_profile(ctx, profile, profile_menu)
+
+
+
+
+
+
+    elif ctx.payload == "vip":
+        profile = get_profile(chat_id)
+        if vip_active(profile):
+            ctx.reply(
+                f"💎 VIP уже активен!\n\n"
+                f"📅 Действует до: {profile['vip_until']}\n\n"
+                f"Вы можете продлить подписку:",
+                keyboard=InlineKeyboard(
+                    [{"text": "🔁 Продлить VIP", "callback": "vip_tariv"}],
+                    [{"text": "⬅ Назад", "callback": "back"}]
+                )
+            )
+        else:
+            ctx.reply(VIP_TEXT, keyboard=vip_start_keyboard)
+            
+    elif ctx.payload == "vip_tariv":
+        ctx.reply("💎 Выберите тариф:", keyboard=vip_keyboard)
+
+
+
+
+
+
+
+
+    elif ctx.payload == "vip_tarif":
+        ctx.reply(
+            "🔁 Выберите тариф для продления:",
+            keyboard=vip_keyboard
+        )
+        return
+
+
+
     elif ctx.payload == "admin_panel":
-        # Показываем админ панель
-        if str(ctx.chat_id) != str(ADMIN_ID):
-            ctx.reply("⛔ Доступ запрещён")
-            return
-        admin(ctx)
+        #Админ панель
+        show_admin_panel(ctx)
+    elif ctx.payload == "admin_vip_on":
+        activate_vip(chat_id, 3650)
+        show_admin_panel(ctx)
+
+    elif ctx.payload == "admin_vip_off":
+        remove_vip(chat_id)
+        show_admin_panel(ctx)
+
+    elif ctx.payload == "admin_refresh":
+        show_admin_panel(ctx)
+
+
+
+
+    elif ctx.payload == "admin_vip_on":
+        activate_vip(chat_id, 3650)  # 10 лет фактически
+        profile = get_profile(chat_id)
+        ctx.reply("✅ VIP включён", keyboard=admin_keyboard(profile))
+    elif ctx.payload == "admin_vip_off":
+        remove_vip(chat_id)
+        profile = get_profile(chat_id)
+        ctx.reply("❌ VIP отключён", keyboard=admin_keyboard(profile))
+
+
+
+
     elif ctx.payload == "open_filters":
         # Открытие фильтров
         show_filters(ctx)
@@ -1165,9 +1330,8 @@ def handle_callback(ctx):
     elif ctx.payload == "cancel_delete":
         # Пользователь отменяет удаление профиля
         ctx.reply("Удаление отменено.", keyboard=main_menu(get_profile(chat_id)))
-    elif ctx.payload == "vip":
-        # Пользователь выбрал просмотр VIP
-        ctx.reply(VIP_TEXT, keyboard=vip_start_keyboard)
+
+
     elif ctx.payload == "show_offer":
         # Пользователь запрашивает оферту
         ctx.reply(OFFER_TEXT, keyboard=vip_offer_keyboard)
@@ -1428,12 +1592,13 @@ def leave_chat(ctx):
 
 # ================== Админ команда ==================
 @bot.command("admin")
-def admin(ctx):
+def show_admin_panel(ctx):
     if str(ctx.chat_id) != str(ADMIN_ID):
         ctx.reply("⛔ Доступ запрещён")
         return
 
     stats = get_stats()
+    profile = get_profile(ctx.chat_id)
 
     text = (
         "📊 *Админ-панель*\n\n"
@@ -1447,23 +1612,31 @@ def admin(ctx):
         f"• Женщин VIP: {stats['vip_f']}"
     )
 
+    ctx.reply(text, keyboard=admin_keyboard(profile))
+
+
     # ------------------ Кнопки ------------------
 
 
-    # Создаем кнопки
-    keyboard = InlineKeyboard(
-        [{"text": "▶️ Запустить BUH", "callback": "start_buh"}],
-        [{"text": "⏹ Остановить BUH", "callback": "stop_buh"}]
+def admin_keyboard(profile):
+    if is_vip(profile):
+        vip_button = {"text": "❌ Отключить VIP (у меня)", "callback": "admin_vip_off"}
+    else:
+        vip_button = {"text": "✅ Включить VIP (у меня)", "callback": "admin_vip_on"}
+
+    return InlineKeyboard(
+        [vip_button],
+        [{"text": "🔄 Обновить", "callback": "admin_refresh"}],
+        [{"text": "⬅ Назад", "callback": "back"}]
     )
 
-    # Отправляем сообщение с клавиатурой
-    ctx.reply(text, keyboard=keyboard)
+
 
 
 
 # ================== Функция статистики ==================
 def get_stats():
-    now = datetime.now().timestamp()
+    now = int(time.time())
     stats = {}
 
     conn = sqlite3.connect(DB_FILE)  # Укажи путь к своей базе
@@ -1504,24 +1677,7 @@ def get_stats():
 
 
 
-# ====== Функции для buh.py ======
-def start_buh(ctx):
-    global buh_process
-    if buh_process and buh_process.poll() is None:
-        ctx.reply("⚠️ buh.py уже запущен")
-        return
-    buh_process = subprocess.Popen([sys.executable, "buh.py"])
-    ctx.reply("✅ buh.py запущен")
 
-def stop_buh(ctx):
-    global buh_process
-    if not buh_process or buh_process.poll() is not None:
-        ctx.reply("⚠️ buh.py не запущен")
-        return
-    buh_process.terminate()
-    buh_process.wait()
-    buh_process = None
-    ctx.reply("✅ buh.py остановлен")
 
 
 
