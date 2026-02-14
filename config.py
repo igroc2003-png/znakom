@@ -1,6 +1,4 @@
-# ================== MAX BOT ==================
-# Токен бота MAX
-TOKEN = "f9LHodD0cOJifvwS05WVOZ0E3rbxxlLRTt5JcHdB2ezESF1dp1N4jaNe9S5_UeZYXBcqF9KC5H8JfaUDfpeg"
+
 
 # ================== DATABASE ==================
 DB_PATH = "profiles.db"
@@ -28,6 +26,7 @@ ROBO_MERCHANT_LOGIN = "ipmav"
 ROBO_PASS1 = "Qazwsxedc1"
 ROBO_PASS2 = "Qazwsxedc2"
 ROBO_TEST = 1  # 1 для тестирования, 0 для реального использования
+
 
 
 
