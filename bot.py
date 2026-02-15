@@ -82,6 +82,21 @@ def main_menu(profile=None, chat_id=None):
     return InlineKeyboard(*buttons)
 
 
+# ================== Клавиатуры ==================
+def main_menu_kb(profile):
+    kb = InlineKeyboard()
+    kb.add_button("💎 Купить VIP", payload="vip_pay")
+    return kb
+
+    age_keyboard = InlineKeyboard()
+    age_keyboard.add_button("Да", payload="age_yes")
+    age_keyboard.add_button("Нет", payload="age_no")
+
+    restore_keyboard = InlineKeyboard()
+    restore_keyboard.add_button("Восстановить", payload="restore_profile")
+
+
+
 def start_bot():
     """Запуск бота с автопереподключением при ошибках сети"""
     log.info("🚀 Bot started")
@@ -381,6 +396,31 @@ def create_db():
     conn.commit()
     conn.close()
 
+
+def create_yookassa_payment(chat_id, tariff):
+    order_id = f"{chat_id}_{int(time.time())}"  # уникальный ID
+    payment = Payment.create({
+        "amount": {
+            "value": str(tariff["price"]),
+            "currency": "RUB"
+        },
+        "confirmation": {
+            "type": "redirect",
+            "return_url": f"https://t.me/YourBotUsername?start=pay_{order_id}"
+        },
+        "capture": True,
+        "description": f"Оплата {tariff['name']} для пользователя {chat_id}",
+        "metadata": {
+            "chat_id": chat_id,
+            "days": tariff["days"]
+        }
+    })
+
+    # Сохраняем order_id в базе
+    save_order(order_id, chat_id, tariff["days"], tariff["price"])
+    return payment.confirmation.confirmation_url, order_id
+
+
 def ensure_columns():
     columns_to_add = {
         "vip_order_id": "TEXT DEFAULT NULL",
@@ -514,6 +554,29 @@ def remove_vip(user_id):
     conn.commit()
     conn.close()
 
+
+# ================== ПУЛЛИНГ ОПЛАТ ==================
+def poll_payments():
+    while True:
+        to_remove = []
+        for chat_id, info in pending_payments.items():
+            try:
+                payment = Payment.find_one(info["payment_id"])
+                if payment.status == "succeeded":
+                    activate_vip(chat_id, info["days"])
+                    bot.send_message(chat_id, f"💎 VIP активирован на {info['days']} дней!")
+                    to_remove.append(chat_id)
+                elif payment.status == "canceled":
+                    bot.send_message(chat_id, "❌ Оплата отменена или не прошла.")
+                    to_remove.append(chat_id)
+            except Exception as e:
+                print(f"[poll] Ошибка проверки платежа для {chat_id}: {e}")
+
+        # удаляем обработанные платежи
+        for chat_id in to_remove:
+            pending_payments.pop(chat_id, None)
+
+        time.sleep(10)  # проверяем каждые 10 секунд
 
 # Получить профиль пользователя
 def get_profile(user_id):
@@ -1136,56 +1199,95 @@ def handle_payment_confirmation(chat_id, payload):
 
 
 
+
+
+
+
+
 # ================== СТАРТ ==================
-
-@bot.on("start")
-def handle_start(ctx):
-    chat_id = str(ctx.chat_id)
-
-    # Если пользователь вернулся после оплаты
-    if ctx.args and ctx.args[0].startswith("pay_"):
-        order_id = ctx.args[0][4:]  # убираем "pay_"
-        
-        # Проверяем статус платежа через YooKassa
-        try:
-            payment = Payment.find_one(order_id)
-            if payment.status == "succeeded":
-                # Получаем данные заказа из метаданных
-                chat_id_meta = payment.metadata.get("chat_id")
-                days = int(payment.metadata.get("days", 0))
-                
-                # Активируем VIP
-                activate_vip(chat_id_meta, days)
-                
-                ctx.reply(f"💎 VIP активирован на {days} дней!")
-            else:
-                ctx.reply("❌ Оплата ещё не завершена или не прошла.")
-        except Exception as e:
-            ctx.reply(f"Ошибка проверки платежа: {e}")
-
-
-
-# ================== СТАРТ =====рабочий=============
 @bot.on("bot_started")
 def start(ctx):
     chat_id = str(ctx.chat_id)
-    profile = get_profile(chat_id)
     users.setdefault(chat_id, {"step": None})
-    u = users [chat_id]
 
     profile = get_profile(chat_id)
     if profile:
         if profile.get("deleted_at"):
             ctx.reply("⚠️ Ваша анкета помечена на удаление. Восстановить?", keyboard=restore_keyboard)
-            return
         else:
-            ctx.reply("Главное меню:", keyboard=main_menu(profile))
-            return
+            ctx.reply("Главное меню:", keyboard=main_menu_kb(profile))
     else:
         ctx.reply("🔞 Вам есть 18 лет?", keyboard=age_keyboard)
 
 
 
+
+
+
+
+
+
+# ================== КНОПКА ОПЛАТЫ VIP ==================
+@bot.on("callback")
+def vip_pay(ctx):
+    chat_id = str(ctx.chat_id)
+    days = 30  # на сколько дней даём VIP
+
+    try:
+        payment = Payment.create({
+            "amount": {
+                "value": "149.00",  # сумма в рублях
+                "currency": "RUB"
+            },
+            "confirmation": {
+                "type": "redirect",
+                "return_url": f"https://t.me/YOUR_BOT_USERNAME?start=pay_{chat_id}_{days}"
+            },
+            "capture": True,
+            "description": f"VIP на {days} дней",
+            "metadata": {
+                "chat_id": chat_id,
+                "days": days
+            }
+        })
+
+        url = payment.confirmation.confirmation_url
+        ctx.reply(f"💎 Оплатите VIP по ссылке: [Перейти к оплате]({url})", parse_mode="Markdown")
+    except Exception as e:
+        ctx.reply(f"Ошибка создания платежа: {e}")
+
+
+
+
+
+def callback_handler(ctx):
+    chat_id = str(ctx.chat_id)
+    payload = ctx.payload
+
+    if payload == "vip_pay":
+        days = 30  # сколько дней VIP
+        try:
+            payment = Payment.create({
+                "amount": {"value": "149.00", "currency": "RUB"},
+                "confirmation": {
+                    "type": "redirect",
+                    "return_url": f"https://t.me/YOUR_BOT_USERNAME"
+                },
+                "capture": True,
+                "description": f"VIP на {days} дней",
+                "metadata": {"chat_id": chat_id, "days": days}
+            })
+            pending_payments[chat_id] = {"payment_id": payment.id, "days": days}
+            ctx.reply(f"💎 Оплатите VIP по ссылке: [Перейти к оплате]({payment.confirmation.confirmation_url})", parse_mode="Markdown")
+        except Exception as e:
+            ctx.reply(f"Ошибка создания платежа: {e}")
+
+    elif payload == "age_yes":
+        ctx.reply("✅ Отлично! Продолжаем…")
+    elif payload == "age_no":
+        ctx.reply("🚫 К сожалению, доступ запрещён.")
+    elif payload == "restore_profile":
+        ctx.reply("✅ Анкета восстановлена!")
 
 
 
@@ -1895,6 +1997,8 @@ def get_stats():
 
 
 
+# ================== ЗАПУСК ПУЛЛИНГА В ОТДЕЛЬНОМ ПОТОКЕ ==================
+    Thread(target=poll_payments, daemon=True).start()
 
 
 
