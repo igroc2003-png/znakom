@@ -18,7 +18,9 @@ IM_SECRET_KEY = "Qawsedrf8"
 IM_TEST = True   # пока тест
 
 
-
+# Настройки yookassa.ru
+YOOKASSA_SHOP_ID = "1262924"                                                  # ID магазина
+YOOKASSA_SECRET_KEY = "live_vhNMjcNeJhnHG0HcBFjCXV1c97DM3Wbgi1Eg-ZHyLmA"      # секретный ключ API
 
 
 # Настройки Robokassa
@@ -26,6 +28,7 @@ ROBO_MERCHANT_LOGIN = "ipmav"
 ROBO_PASS1 = "Qazwsxedc1"
 ROBO_PASS2 = "Qazwsxedc2"
 ROBO_TEST = 1  # 1 для тестирования, 0 для реального использования
+
 
 
 
