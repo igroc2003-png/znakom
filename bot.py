@@ -2,10 +2,11 @@ import sqlite3
 import logging
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from maxgram import Bot
 from maxgram.keyboards import InlineKeyboard
-from config import TOKEN, ADMIN_ID, SUPPORT_URL, IM_ESHOP_ID, IM_SECRET_KEY, IM_TEST
+from config import TOKEN, ADMIN_ID, SUPPORT_URL, IM_ESHOP_ID, IM_SECRET_KEY, IM_TEST, YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY
+from yookassa import Configuration, Payment
 import hashlib
 import urllib.parse
 import sys
@@ -33,6 +34,17 @@ active_chats = {}              # Активные чаты рулетки: user_
 contexts = {}                  # Контексты пользователей для рулетки: user_id -> ctx
 chat_started_at = {}           # 👈 ВАЖНО (у тебя из-за этого была ошибка)
 buh_process = None             # глобальная переменная для процесса buh.py
+# Настройка YooKassa
+Configuration.account_id = YOOKASSA_SHOP_ID
+Configuration.secret_key = YOOKASSA_SECRET_KEY
+# ======= Тарифы =======
+TARIFFS = {
+    "vip_30": {"days": 30, "price": 300, "name": "VIP 30 дней"},
+    "vip_180": {"days": 180, "price": 1500, "name": "VIP 6 месяцев"},
+    "vip_365": {"days": 365, "price": 2500, "name": "VIP 12 месяцев"},
+}
+
+
 # ================== КЛАВИАТУРЫ ==================
 
 # Главное меню анкеты
@@ -96,6 +108,16 @@ vip_keyboard = InlineKeyboard(
     [{"text": "💳 VIP 12 месяцев — 2500 ₽", "callback": "vip_365"}],
     [{"text": "⬅️ Назад", "callback": "back"}]
 	)
+
+# Клавиатура VIP продление
+vip_tarif_keyboard = InlineKeyboard(
+    [{"text": "💳 VIP 30 дней — 300 ₽", "callback": "vip_30"}],
+    [{"text": "💳 VIP 6 месяцев — 1500 ₽", "callback": "vip_180"}],
+    [{"text": "💳 VIP 12 месяцев — 2500 ₽", "callback": "vip_365"}],
+    [{"text": "⬅️ Назад", "callback": "back"}]
+	)
+
+
 
 # Клавиатура оферты VIP
 vip_offer_keyboard = InlineKeyboard(
@@ -344,7 +366,7 @@ def create_db():
             about TEXT,
             photo_url TEXT,
             is_vip INTEGER DEFAULT 0,
-            vip_until INTEGER DEFAULT NULL,
+            vip_until TEXT DEFAULT NULL,
             deleted_at TEXT DEFAULT NULL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             filters_gender TEXT DEFAULT 'Любой',
@@ -353,12 +375,59 @@ def create_db():
             filters_city TEXT DEFAULT 'Любой',
             filters_region TEXT DEFAULT 'Любой',
             is_subscribed INTEGER DEFAULT 0,
-            subscription_expire INTEGER DEFAULT NULL
+            subscription_expire TEXT DEFAULT NULL
         );
     """)
     conn.commit()
     conn.close()
+
+def ensure_columns():
+    columns_to_add = {
+        "vip_order_id": "TEXT DEFAULT NULL",
+        "vip_price": "REAL DEFAULT NULL"
+    }
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # Получаем текущие колонки
+    cursor.execute("PRAGMA table_info(profiles);")
+    existing_columns = [col[1] for col in cursor.fetchall()]
+
+    # Добавляем недостающие колонки
+    for column, definition in columns_to_add.items():
+        if column not in existing_columns:
+            cursor.execute(f"ALTER TABLE profiles ADD COLUMN {column} {definition};")
+            print(f"Добавлена колонка: {column}")
+
+    conn.commit()
+    conn.close()
     
+    
+    
+    
+def save_order(order_id, user_id, days, price):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Вычисляем дату окончания VIP
+    vip_until = datetime.now() + timedelta(days=days)
+    
+    # Обновляем профиль
+    cursor.execute("""
+        UPDATE profiles
+        SET is_vip = 1,
+            vip_until = ?,
+            vip_order_id = ?,
+            vip_price = ?
+        WHERE user_id = ?
+    """, (vip_until.strftime("%Y-%m-%d %H:%M:%S"), order_id, price, user_id))
+    
+    conn.commit()
+    conn.close()
+
+
+
 def get_admin_stats():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -398,6 +467,20 @@ def update_filter(user_id, field, value):
       conn.commit()
       conn.close()
       log.info(f"🔧 filter {field}={value} saved for {user_id}")
+      
+def is_vip(user):
+    """
+    Проверка, активен ли VIP для пользователя
+    user — словарь или запись из sqlite с полем vip_until
+    """
+    vip_until = user.get("vip_until")
+    if not vip_until:
+        return False
+    try:
+        vip_time = datetime.strptime(vip_until, "%Y-%m-%d %H:%M:%S")
+        return datetime.now() < vip_time
+    except:
+        return False
     
 def delete_profile(user_id):
     conn = sqlite3.connect(DB_FILE)
@@ -407,13 +490,15 @@ def delete_profile(user_id):
     conn.close()
 
 def activate_vip(user_id, days=3650):
-    vip_until = int(time.time()) + days * 24 * 60 * 60
+    # вычисляем дату окончания VIP
+    vip_time = datetime.now() + timedelta(days=days)
+    vip_until_str = vip_time.strftime("%Y-%m-%d %H:%M:%S")  # ❌ строка, а не timestamp
 
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE profiles SET is_vip=1, vip_until=? WHERE user_id=?",
-        (vip_until, user_id)
+        (vip_until_str, user_id)
     )
     conn.commit()
     conn.close()
@@ -590,15 +675,26 @@ def show_filters(ctx):
 
 
 def vip_active(profile):
+    """
+    Проверяет, активен ли VIP.
+    profile — словарь профиля с полем 'vip_until' как текст в формате 'YYYY-MM-DD HH:MM:SS'
+    """
     if not profile:
         return False
 
     vip_until = profile.get("vip_until")
-
     if not vip_until:
         return False
 
-    return vip_until > int(time.time())
+    try:
+        # Преобразуем строку в datetime
+        vip_time = datetime.strptime(vip_until, "%Y-%m-%d %H:%M:%S")
+        return datetime.now() < vip_time
+    except Exception as e:
+        print(f"[VIP CHECK ERROR] {e}")
+        return False
+
+
 
 
 
@@ -607,15 +703,8 @@ def vip_active(profile):
 
 
 def is_vip(profile):
-    if not profile:
-        return False
+    return vip_active(profile)
 
-    vip_until = profile.get("vip_until")
-
-    if not vip_until:
-        return False
-
-    return vip_until > int(time.time())
 
 
 
@@ -964,9 +1053,119 @@ def text_steps(ctx):
 
 
 
+# Настраиваем тарифы
+tariffs = {
+    "vip_30": {"days": 30, "price": 300, "name": "VIP 30 дней"},
+    "vip_90": {"days": 90, "price": 800, "name": "VIP 90 дней"},
+    "vip_365": {"days": 365, "price": 3000, "name": "VIP 365 дней"},
+}
+
+# Универсальная функция активации VIP
+def activate_vip_for_profile(profile, days):
+    now = datetime.now()
+    
+    if profile.get("vip_until"):
+        try:
+            vip_until = datetime.strptime(profile["vip_until"], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            vip_until = now
+        if vip_until > now:
+            new_vip_until = vip_until + timedelta(days=days)
+        else:
+            new_vip_until = now + timedelta(days=days)
+    else:
+        new_vip_until = now + timedelta(days=days)
+    
+    profile["vip_until"] = new_vip_until.strftime("%Y-%m-%d %H:%M:%S")
+    save_profile(profile)
+    return new_vip_until
+
+# Единый обработчик кнопок оплаты
+def handle_vip(ctx, chat_id):
+    payload = ctx.payload
+
+    if payload not in tariffs:
+        ctx.reply("❌ Неизвестный тариф")
+        return
+
+    tariff = tariffs[payload]
+    profile = get_profile(chat_id)
+
+    # Проверка, активен ли VIP
+    if profile.get("vip_until"):
+        try:
+            vip_until = datetime.strptime(profile["vip_until"], "%Y-%m-%d %H:%M:%S")
+            if vip_until > datetime.now():
+                ctx.reply("💎 VIP уже активен")
+                return
+        except ValueError:
+            pass
+
+    # Генерация ссылки на оплату через IntellectMoney (или другой метод)
+    order_id = f"{chat_id}_{int(time.time())}"
+    link = intellectmoney_link(
+        order_id=order_id,
+        amount=tariff["price"],
+        client_email="email@address.com"
+    )
+
+    # Отправляем клавиатуру оплаты
+    ctx.reply(
+        f"{tariff['name']}\nСтоимость: {tariff['price']} ₽\nВыберите способ оплаты 👇",
+        keyboard=InlineKeyboard(
+            [{"text": "💳 Банковская карта (IntellectMoney)", "url": link}],
+            [{"text": "🟣 ЮMoney", "url": link}],
+            [{"text": "⚡ СБП", "url": link}],
+            [{"text": "🟢 SberPay", "url": link}],
+            [{"text": "❌ Отмена", "callback": "back"}]
+        )
+    )
+
+# Обработчик подтверждения оплаты (пример)
+def handle_payment_confirmation(chat_id, payload):
+    if payload not in tariffs:
+        return
+
+    tariff = tariffs[payload]
+    profile = get_profile(chat_id)
+    new_vip_until = activate_vip_for_profile(profile, tariff["days"])
+    
+    # Ответ пользователю
+    return f"💎 VIP активирован на {tariff['days']} дней!\nДействует до: {new_vip_until.strftime('%d.%m.%Y %H:%M')}"
+
+
 
 
 # ================== СТАРТ ==================
+
+@bot.on("start")
+def handle_start(ctx):
+    chat_id = str(ctx.chat_id)
+
+    # Если пользователь вернулся после оплаты
+    if ctx.args and ctx.args[0].startswith("pay_"):
+        order_id = ctx.args[0][4:]  # убираем "pay_"
+        
+        # Проверяем статус платежа через YooKassa
+        try:
+            payment = Payment.find_one(order_id)
+            if payment.status == "succeeded":
+                # Получаем данные заказа из метаданных
+                chat_id_meta = payment.metadata.get("chat_id")
+                days = int(payment.metadata.get("days", 0))
+                
+                # Активируем VIP
+                activate_vip(chat_id_meta, days)
+                
+                ctx.reply(f"💎 VIP активирован на {days} дней!")
+            else:
+                ctx.reply("❌ Оплата ещё не завершена или не прошла.")
+        except Exception as e:
+            ctx.reply(f"Ошибка проверки платежа: {e}")
+
+
+
+# ================== СТАРТ =====рабочий=============
 @bot.on("bot_started")
 def start(ctx):
     chat_id = str(ctx.chat_id)
@@ -997,82 +1196,96 @@ def start(ctx):
 # Обработчик колбэков
 # Обработчик колбэков
 # Обработчик колбэков
+# Обработчик колбэков
 @bot.on("message_callback")
 def handle_callback(ctx):
     chat_id = str(ctx.chat_id)
-    global users  # Обращаемся к глобальному слою users
-
-    # Если пользователя нет в списке, добавляем пустой объект
-    if chat_id not in users:
-        users[chat_id] = {}
-
-    # Получаем объект пользователя
+    payload = ctx.payload
+    users.setdefault(chat_id, {"step": None})
     u = users[chat_id]
-
-    # Обрабатываем колбэки
-    if ctx.payload == "vip_30":
-        profile = get_profile(chat_id)
-        if vip_active(profile):
-            ctx.reply("💎 VIP уже активен")
-            return
-        tariff_price = 300
-        order_id = f"{chat_id}_{int(time.time())}"
-        link = intellectmoney_link(
+    profile = get_profile(chat_id)
+ 
+    
+    # ======= Обработка тарифов =======
+    if payload in TARIFFS:
+        tariff = TARIFFS[payload]
+        try:
+            # Генерируем уникальный order_id
+            order_id = f"{chat_id}_{int(time.time())}"
+            
+            # 👉 Генерация ссылки IntellectMoney
+            intellectmoney_link_url = intellectmoney_link(
             order_id=order_id,
-            amount=tariff_price,
-            client_email="email@address.com"
+            amount=tariff["price"],
+            client_email="test@email.ru"
         )
-        ctx.reply(
-            "💎 VIP 30 дней\n"
-            f"Стоимость: {tariff_price} ₽\n"
-            "Выберите способ оплаты 👇",
+
+
+            # Создаём платеж в YooKassa
+            payment = Payment.create({
+                "amount": {
+                    "value": str(tariff["price"]),
+                    "currency": "RUB"
+                },
+                "confirmation": {
+                   "type": "redirect",
+                    "return_url": f"https://t.me/YourBotUsername?start=pay_{order_id}"
+                },
+                "capture": True,
+                "description": f"Оплата {tariff['name']} для пользователя {chat_id}",
+                "metadata": {
+                    "chat_id": chat_id,
+                    "order_id": order_id,
+                    "days": tariff["days"]
+                }
+            })
+
+            payment_url = payment.confirmation.confirmation_url
+
+            # Сохраняем заказ только здесь
+            save_order(order_id, chat_id, tariff["days"], tariff["price"])
+
+
+    # ======= Сообщение с кнопками оплаты =======
+            ctx.reply(
+            f"💎 {tariff['name']}\nСтоимость: {tariff['price']} ₽\nВыберите способ оплаты 👇",
             keyboard=InlineKeyboard(
-                [{"text": "💳 Банковская карта (IntellectMoney)", "url": link}],
-                [{"text": "💳 Банковская карта", "url": link}],
-                [{"text": "🟣 ЮMoney", "url": link}],
-                [{"text": "⚡ СБП", "url": link}],
-                [{"text": "🟢 SberPay", "url": link}],
+                [{"text": "💳 Банковская карта (IntellectMoney)", "url": intellectmoney_link_url}],
+                [{"text": "💳 Банковская карта", "url": payment_url}],
+                [{"text": "🟣 ЮMoney", "url": payment_url}],
+                [{"text": "⚡ СБП", "url": payment_url}],
+                [{"text": "🟢 SberPay", "url": payment_url}],
                 [{"text": "❌ Отмена", "callback": "back"}]
             )
         )
 
-
-    elif ctx.payload == "vip_180":
-        tariff_price = 1500
-        order_id = f"{chat_id}_{int(time.time())}"
-        client_email = "email@address.com"  # сюда можешь подставить реальный email
-        link = intellectmoney_link(
-            order_id=order_id,
-            amount=tariff_price,
-            client_email=client_email
-        )
-        reply_text = f'Вы выбрали тариф "VIP 6 месяцев" стоимостью {tariff_price} рублей.'
-        reply_keyboard = InlineKeyboard(
-            [{"text": "💳 Оплатить", "url": link}],
-            [{"text": "Отмена", "callback": "back"}]
-        )
-        ctx.reply(reply_text, keyboard=reply_keyboard)
-
-
-    elif ctx.payload == "vip_365":
-        tariff_price = 2500
-        order_id = f"{chat_id}_{int(time.time())}"
-        client_email = "email@address.com"
-        link = intellectmoney_link(
-            order_id=order_id,
-            amount=tariff_price,
-            client_email=client_email
-        )
-        reply_text = f'Вы выбрали тариф "VIP 12 месяцев" стоимостью {tariff_price} рублей.'
-        reply_keyboard = InlineKeyboard(
-            [{"text": "💳 Оплатить", "url": link}],
-            [{"text": "Отмена", "callback": "back"}]
-        )
-        ctx.reply(reply_text, keyboard=reply_keyboard)
+        except Exception as e:
+            ctx.reply("Ошибка при создании платежа ❌")
+            log.error(f"Payment error: {e}")
+        return
 
 
 
-    elif ctx.payload == "open_profile":
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   # ======= Остальные колбэки =======
+    if ctx.payload == "open_profile":
         # Показываем профиль пользователя
         profile = get_profile(chat_id)
         if not profile:
@@ -1113,7 +1326,7 @@ def handle_callback(ctx):
     elif ctx.payload == "vip_tarif":
         ctx.reply(
             "🔁 Выберите тариф для продления:",
-            keyboard=vip_keyboard
+            keyboard=vip_tarif_keyboard
         )
         return
 
@@ -1691,5 +1904,6 @@ def get_stats():
 if __name__ == "__main__":
     log.info("🚀 Bot started")
     create_db()  # создаем таблицу, если её нет
+    ensure_columns()  # проверяем и добавляем колонки при старте
     delete_expired_profiles()
     bot.run()
