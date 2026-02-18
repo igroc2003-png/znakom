@@ -45,8 +45,6 @@ TARIFFS = {
     "vip_365": {"days": 365, "price": 2500, "name": "VIP 12 месяцев"},
 }
 
-
-
 def poll_payments():
     while True:
         try:
@@ -199,8 +197,6 @@ vip_tarif_keyboard = InlineKeyboard(
     [{"text": "⬅️ Назад", "callback": "back"}]
 	)
 
-
-
 # Клавиатура оферты VIP
 vip_offer_keyboard = InlineKeyboard(
     [{"text": "✅ Согласен", "callback": "offer_accept"}],
@@ -289,11 +285,6 @@ OFFER_TEXT = """
 ОГРНИП: 324420500025722
 """
 
-
-
-
- 
-
 # Клавиатура проверки возраста
 age_keyboard = InlineKeyboard([
     {"text": "✅ Да, мне есть 18", "callback": "age_yes"},
@@ -362,13 +353,10 @@ restore_keyboard = InlineKeyboard([
 
 
 
-
-
 # Фильтры
 MIN_AGE_LIMIT = 18
 MAX_AGE_LIMIT = 100
 
-# Главное меню фильтров
 # Главное меню фильтров
 def keyboard_filters(profile=None):
     return InlineKeyboard(
@@ -392,9 +380,6 @@ gender_filters = InlineKeyboard(
         {"text": "🎭 Любой", "callback": "gender_filter_any"}
     ]
 )
-
-
-
 
 # Возраст
 def age_keyboard_filters(min_age, max_age):
@@ -422,9 +407,6 @@ def vip_menu():
         [{"text": "⬅️ В меню", "callback": "back"}]
     )
 
-
-
-
 # Клавиатура рулетки
 ruletka_keyboard = InlineKeyboard(
     [{"text": "▶ Найти собеседника", "callback": "roulette_in"}],
@@ -432,7 +414,6 @@ ruletka_keyboard = InlineKeyboard(
 )
 
 # ================== БАЗА ДАННЫХ ==================
-# ------------------ Создание базы и профилей ------------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -558,6 +539,28 @@ def init_db():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
     """)
+    
+    # Таблица статистики
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS stats (
+        user_id TEXT PRIMARY KEY,
+        chats_started INTEGER DEFAULT 0,
+        chats_finished INTEGER DEFAULT 0,
+        roulette_joins INTEGER DEFAULT 0
+    )
+    """)
+
+    # Таблица платежей
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT NOT NULL,
+        payment_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        days INTEGER,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
 
     conn.commit()
     conn.close()
@@ -573,7 +576,6 @@ def set_chat_timer(seconds):
     conn.commit()
     conn.close()
     
-
 # Функция для получения текущего значения таймера
 def get_chat_timer():
     conn = sqlite3.connect(DB_FILE)
@@ -686,7 +688,6 @@ def save_order(order_id, user_id, days, price):
     conn.commit()
     conn.close()
 
-
 # ------------------ Фильтры ------------------
 def update_filter(user_id, field, value):
     conn = sqlite3.connect(DB_FILE)
@@ -753,7 +754,6 @@ def activate_vip(user_id, days):
     )
     conn.commit()
     conn.close()
-
 
   
 # ================== УНИВЕРСАЛЬНЫЙ ВЫБОР ГОРОДА ==================
@@ -865,13 +865,6 @@ def show_filters(ctx):
 
 
 
-
-
-
-
-
-
-
 def vip_active(profile):
     """
     Проверяет, активен ли VIP.
@@ -891,8 +884,6 @@ def vip_active(profile):
     except Exception as e:
         print(f"[VIP CHECK ERROR] {e}")
         return False
-
-
 
 
 # Функция для автоматического отключения чата
@@ -919,12 +910,6 @@ def auto_leave_if_non_vip(user_id, partner_id):
                 p_ctx.reply("Время истекло. Оба участника не имеют VIP-статус, поэтому чат автоматически закрыт.")
 
  
-
-
-
-
-
-
 
 def is_vip(profile):
     """
@@ -996,11 +981,6 @@ def intellectmoney_link(order_id: str, amount: float, client_email: str) -> str:
 
 
 
-
-
-
-
-
 # ================== ОБРАБОТЧИК ==================
 @bot.on("message_created")
 #Установка таймера в админке
@@ -1031,26 +1011,18 @@ def handle_timer_input(ctx):
 def relay(ctx):
     user_id = str(ctx.chat_id)
     contexts[user_id] = ctx
-	
 	# Сначала обрабатываем шаги анкеты
     text_steps(ctx)
-    
-
     # ❗ Если это callback — выходим
     if ctx.payload:
         return
-
     if user_id not in active_chats:
         return
-
     partner_id = active_chats[user_id]
-
     text = ctx.message.get("body", {}).get("text")
     if not text:
         return
-
     log.info(f"[Relay] {user_id} -> {partner_id}: {text}")
-
     if partner_id in contexts:
         contexts[partner_id].reply(text)
 
@@ -1103,7 +1075,6 @@ def text_steps(ctx):
         u["step"] = "birth_month"
         ctx.reply("Введите месяц рождения (1–12):")
         return
-
     if step == "birth_month":
         if not text.isdigit() or not 1 <= int(text) <= 12:
             ctx.reply("Введите число от 1 до 12")
@@ -1112,7 +1083,6 @@ def text_steps(ctx):
         u["step"] = "birth_year"
         ctx.reply("Введите год рождения:")
         return
-
     if step == "birth_year":
         if not text.isdigit():
             ctx.reply("Введите год числом")
@@ -1154,16 +1124,6 @@ def text_steps(ctx):
         send_city_selection(ctx, text)
         return
 
-
-
-           
-   
-
-    
-    
-    
-    
-    
     # -------- Обо мне --------
     if step == "about":
         if not text:
@@ -1211,11 +1171,6 @@ def text_steps(ctx):
 
 ###############################################################################
 
-
-    
-
-
-
     if ctx.payload == "vip_menu":
 
         profile = get_profile(chat_id)
@@ -1243,12 +1198,6 @@ def text_steps(ctx):
 
         ctx.reply(text, keyboard=keyboard, parse_mode="Markdown")
 
-
-
-  
-
-
-
     if ctx.text.startswith("/givevip") and chat_id == ADMIN_ID:
         try:
             user_id = int(ctx.text.split()[1])
@@ -1266,16 +1215,6 @@ def text_steps(ctx):
             ctx.reply(f"VIP удалён у пользователя {user_id}")
         except:
             ctx.reply("Использование: /removevip user_id")
-
-
-
-
-
-
-
-
-
-
 
 # Настраиваем тарифы
 tariffs = {
@@ -1358,13 +1297,6 @@ def handle_payment_confirmation(chat_id, payload):
     return f"💎 VIP активирован на {tariff['days']} дней!\nДействует до: {new_vip_until.strftime('%d.%m.%Y %H:%M')}"
 
 
-
-
-
-
-
-
-
 # ================== СТАРТ ==================
 @bot.on("bot_started")
 def start(ctx):
@@ -1379,14 +1311,6 @@ def start(ctx):
             ctx.reply("Главное меню:", keyboard=main_menu_kb(profile))
     else:
         ctx.reply("🔞 Вам есть 18 лет?", keyboard=age_keyboard)
-
-
-
-
-
-
-
-
 
 # ================== КНОПКА ОПЛАТЫ VIP ==================
 @bot.on("callback")
@@ -1416,10 +1340,6 @@ def vip_pay(ctx):
         ctx.reply(f"💎 Оплатите VIP по ссылке: [Перейти к оплате]({url})", parse_mode="Markdown")
     except Exception as e:
         ctx.reply(f"Ошибка создания платежа: {e}")
-
-
-
-
 
 def callback_handler(ctx):
     chat_id = str(ctx.chat_id)
@@ -1451,15 +1371,7 @@ def callback_handler(ctx):
         ctx.reply("✅ Анкета восстановлена!")
 
 
-
-
-
-
-# Обработчик колбэков
-# Обработчик колбэков
-# Обработчик колбэков
-# Обработчик колбэков
-# Обработчик колбэков
+#=============== Обработчик колбэков=========
 @bot.on("message_callback")
 def handle_callback(ctx):
     chat_id = str(ctx.chat_id)
@@ -1484,7 +1396,6 @@ def handle_callback(ctx):
             amount=tariff["price"],
             client_email="test@email.ru"
         )
-
 
             # Создаём платеж в YooKassa
             payment = Payment.create({
@@ -1530,25 +1441,6 @@ def handle_callback(ctx):
         return
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
    # ======= Остальные колбэки =======
     if ctx.payload == "open_profile":
         # Показываем профиль пользователя
@@ -1557,10 +1449,6 @@ def handle_callback(ctx):
             ctx.reply("Анкета не найдена")
             return
         show_profile(ctx, profile, profile_menu)
-
-
-
-
 
 
     elif ctx.payload == "vip":
@@ -1580,34 +1468,17 @@ def handle_callback(ctx):
             
     elif ctx.payload == "vip_tariv":
         ctx.reply("💎 Выберите тариф:", keyboard=vip_keyboard)
-
-
-
-
-
-
-
-
     elif ctx.payload == "vip_tarif":
         ctx.reply(
             "🔁 Выберите тариф для продления:",
             keyboard=vip_tarif_keyboard
         )
         return
-
-
-
     elif ctx.payload == "admin_panel":
         #Админ панель
         show_admin_panel(ctx)
-
-
     elif ctx.payload == "admin_refresh":
         show_admin_panel(ctx)
-
-
-
-
     elif ctx.payload == "admin_vip_on":
         activate_vip(chat_id, 3650)  # 10 лет фактически
         profile = get_profile(chat_id)
@@ -1616,10 +1487,6 @@ def handle_callback(ctx):
         remove_vip(chat_id)
         profile = get_profile(chat_id)
         ctx.reply("❌ VIP отключён", keyboard=admin_keyboard(profile))
-
-
-
-
     elif ctx.payload == "open_filters":
         # Открытие фильтров
         show_filters(ctx)
@@ -1667,7 +1534,6 @@ def handle_callback(ctx):
             max_age = max(min_age, max_age - 1)
         elif ctx.payload == "age_max_plus":
             max_age = min(MAX_AGE_LIMIT, max_age + 1)
-
         update_filter(chat_id, "filters_age_min", min_age)
         update_filter(chat_id, "filters_age_max", max_age)
         ctx.reply("Выберите возраст для фильтров:", keyboard=age_keyboard_filters(min_age, max_age))
@@ -1700,16 +1566,13 @@ def handle_callback(ctx):
         # === ВЫБОР ГОРОДА ===
         _, city_data = ctx.payload.split(":", 1)
         city, region = city_data.split("|")
-
         mode = u.get("city_mode")
-
         # === СОЗДАНИЕ АНКЕТЫ ===
         if mode == "profile_create":
             u["city"] = city
             u["region"] = region
             u["step"] = "about"
             u["city_mode"] = None
-
             ctx.reply(
                 f"🏙 Город выбран: {city} ({region})\n\n"
                 "Расскажите немного о себе:"
@@ -1745,19 +1608,11 @@ def handle_callback(ctx):
             )
             return
 
-
-
-
-
     elif ctx.payload == "edit_city":
         # Редактирование города
         u["step"] = "city_search"
         u["city_mode"] = "profile_edit"
         ctx.reply("Введите первые буквы нового города:")
-
-   
-
-
     elif ctx.payload == "delete":
         # Пользователь хочет удалить профиль
         ctx.reply("Вы уверены, что хотите удалить анкету?", keyboard=delete_confirm_keyboard)
@@ -1768,8 +1623,6 @@ def handle_callback(ctx):
         # Пользователь сохраняет профиль
         save_profile(chat_id, u)
         ctx.reply("Профиль успешно сохранён!", keyboard=main_menu(get_profile(chat_id)))
-    
-    
     elif ctx.payload == "delete_profile":
         # Пользователь хочет удалить профиль
         ctx.reply(
@@ -1777,33 +1630,23 @@ def handle_callback(ctx):
             "Вы уверены, что хотите удалить анкету?",
             keyboard=delete_confirm_keyboard
         )
-
     elif ctx.payload == "done_edit":
         # Сохраняем изменения и показываем меню редактирования
         save_profile(chat_id, u)  # сохраняем текущие данные пользователя
         ctx.reply("Изменения сохранены!", keyboard=edit_keyboard)  # показываем клавиатуру редактирования
-   
-    
-    
-
     elif ctx.payload == "confirm_delete":
         # Помечаем профиль на удаление
         soft_delete_profile(chat_id)
-
         # Получаем профиль заново
         profile = get_profile(chat_id)
-
         # Отправляем сообщение о пометке на удаление с клавиатурой восстановления
         ctx.reply(
             "⚠️ Ваша анкета помечена на удаление. Восстановить?", 
             keyboard=restore_keyboard
         )
-
     elif ctx.payload == "cancel_delete":
         # Пользователь отменяет удаление профиля
         ctx.reply("Удаление отменено.", keyboard=main_menu(get_profile(chat_id)))
-
-
     elif ctx.payload == "show_offer":
         # Пользователь запрашивает оферту
         ctx.reply(OFFER_TEXT, keyboard=vip_offer_keyboard)
@@ -1853,24 +1696,15 @@ def handle_callback(ctx):
     elif ctx.payload == "edit_profile":
         # Переход в режим редактирования профиля
         ctx.reply("Что вы хотите изменить?", keyboard=edit_keyboard)
-
-
     elif ctx.payload == "ruletka":
         # Запуск чата-рулетки
         ctx.reply(
             "💬 Чат-рулетка готова. Выберите действие:",
             keyboard=ruletka_keyboard
         )
-
-
-
-
     elif ctx.payload == "vip_tariv":
         # Просмотр тарифов VIP
         ctx.reply("💎 Выберите тариф для подписки", keyboard=vip_keyboard)
-    
-    
-    
     elif ctx.payload == "restore_profile":
         profile = get_profile(chat_id)
         if profile.get("deleted_at"):
@@ -1880,37 +1714,22 @@ def handle_callback(ctx):
             cursor.execute("UPDATE profiles SET deleted_at=NULL WHERE user_id=?", (chat_id,))
             conn.commit()
             conn.close()
-
             ctx.reply("♻ Ваша анкета восстановлена!", keyboard=main_menu(profile))
         else:
             ctx.reply("Анкета не была удалена или уже восстановлена.", keyboard=main_menu(profile))
-
-
     elif ctx.payload == "cancel_restore":
         # Пользователь отказался восстановить
         ctx.reply("❌ Анкета не восстановлена.", keyboard=restore_keyboard)
-
     elif ctx.payload == "ruletka":
         # Запуск чата-рулетки
         ctx.reply(
             "💬 Чат-рулетка готова. Выберите действие:",
             keyboard=ruletka_keyboard
         )
-
     elif ctx.payload == "roulette_in":
         roulette_in(ctx)
-
     elif ctx.payload == "roulette_out":
         roulette_out(ctx)
-
-
-
-
-
-
-
-       
-
     elif ctx.payload == "admin_timer":
         current = get_chat_timer()
         ctx.reply(
@@ -1919,25 +1738,9 @@ def handle_callback(ctx):
         )
         # сохраняем состояние
         user_states[str(ctx.chat_id)] = "waiting_timer"
-        
-
-
-
-
-
-
     else:
         print("Необработанный колбэк:", ctx.payload)
 		
-		
-
-        
-        
-        
-
-
-
-
 # ================== РУЛЕТКА ==================
 @bot.command("roulette")
 #Фильтры
@@ -1970,8 +1773,6 @@ def get_filters(user_id):
     return filters
 
 
-
-# --------------------- Вход в чата
 # --------------------- Вход в рулетку
 def roulette_in(ctx):
     user_id = str(ctx.chat_id)
@@ -2206,15 +2007,6 @@ def roulette_out(ctx):
 
 
 # ================== АДМИН ПАНЕЛЬ ==================
-
-
-
-
-
-
-
-
-# ================== Админ панель ==================
 @bot.command("admin")
 def show_admin_panel(ctx):
     if str(ctx.chat_id) != str(ADMIN_ID):
@@ -2261,43 +2053,6 @@ def admin_keyboard(profile):
         [{"text": "🔄 Обновить", "callback": "admin_refresh"}],
         [{"text": "⬅ Назад", "callback": "back"}]
     )
-
-
-
-
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ================== Функция статистики ==================
 # ================== Функция статистики ==================
 def get_stats():
     now = int(time.time())
@@ -2345,9 +2100,7 @@ def get_stats():
 
 
     # ================== РУЛЕТКА ==================
-    # ⚠ Поменяй названия таблиц если у тебя другие!
-
-    # В очереди
+        # В очереди
     cursor.execute("SELECT COUNT(*) FROM roulette_queue")
     stats["waiting_queue"] = cursor.fetchone()[0]
 
@@ -2407,9 +2160,6 @@ def log_chat_ended(user_id):
     cursor.execute("UPDATE roulette_stats SET chats_ended = chats_ended + 1 WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
-
-
-
 
 # Главная функция старта
 if __name__ == "__main__":
