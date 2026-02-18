@@ -11,16 +11,14 @@ import hashlib
 import urllib.parse
 import sys
 import subprocess
+import random
 #from payment import create_payment_link
 
 # ================== ЛОГИ ==================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - BOT - %(levelname)s - %(message)s"
-)
+# Настройки логирования
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - BOT - %(levelname)s - %(message)s")
 log = logging.getLogger("BOT")
-
 
 # ================== ИНИЦИАЛИЗАЦИЯ БОТА ==================
 bot = Bot(TOKEN)
@@ -29,11 +27,14 @@ bot = Bot(TOKEN)
 GEO_DB = "geo.db"
 DB_FILE = "profiles.db"        # Используем существующую таблицу профилей
 users = {}                     # Временные данные при заполнении анкеты
+user_states = {}               # Временные данные при заполнении таймера
 queue = []                     # Очередь для игры в рулетку
 active_chats = {}              # Активные чаты рулетки: user_id -> partner_id
 contexts = {}                  # Контексты пользователей для рулетки: user_id -> ctx
 chat_started_at = {}           # 👈 ВАЖНО (у тебя из-за этого была ошибка)
 buh_process = None             # глобальная переменная для процесса buh.py
+bot.user_states = {}
+pending_payments = {}
 # Настройка YooKassa
 Configuration.account_id = YOOKASSA_SHOP_ID
 Configuration.secret_key = YOOKASSA_SECRET_KEY
@@ -45,6 +46,68 @@ TARIFFS = {
 }
 
 
+
+def poll_payments():
+    while True:
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+
+            # Берём все pending платежи
+            cursor.execute("SELECT id, chat_id, days FROM payments WHERE status='pending'")
+            payments = cursor.fetchall()
+
+            for payment in payments:
+                payment_id, chat_id, days = payment
+
+                cursor.execute("UPDATE payments SET status='done' WHERE id=?", (payment_id,))
+                conn.commit()
+
+                activate_vip(chat_id, days * 24 * 3600)
+                bot.send_message(chat_id, "✅ Ваш VIP активирован после платежа!")
+
+        except Exception as e:
+            print("Ошибка в poll_payments:", e)
+        finally:
+            conn.close()
+
+        time.sleep(60)
+
+
+
+# ------------------- Запуск потока -------------------
+# Вставить один раз после создания объекта bot
+threading.Thread(target=poll_payments, daemon=True).start()
+
+
+# ------------------ Статистика пользователей ------------------
+def increment_stat(user_id, field):
+    """
+    Увеличивает поле статистики на 1 для пользователя.
+    Поля могут быть:
+      - 'roulette_joins'  — вход в очередь рулетки
+      - 'chats_started'   — начало чата
+      - 'chats_finished'  — завершение чата
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # Проверяем, есть ли запись пользователя
+    cursor.execute("SELECT 1 FROM stats WHERE user_id=?", (user_id,))
+    if cursor.fetchone() is None:
+        # Если нет, создаём запись с нулями
+        cursor.execute(
+            "INSERT INTO stats (user_id, roulette_joins, chats_started, chats_finished) VALUES (?, 0, 0, 0)",
+            (user_id,)
+        )
+
+    # Увеличиваем нужное поле на 1
+    cursor.execute(
+        f"UPDATE stats SET {field} = {field} + 1 WHERE user_id=?",
+        (user_id,)
+    )
+    conn.commit()
+    conn.close()
 
 
 # ================== КЛАВИАТУРЫ ==================
@@ -364,8 +427,8 @@ def vip_menu():
 
 # Клавиатура рулетки
 ruletka_keyboard = InlineKeyboard(
-    [{"text": "▶ Найти собеседника", "callback": "roulette"}],
-    [{"text": "⏹ Выйти из чата", "callback": "leave_chat"}]
+    [{"text": "▶ Найти собеседника", "callback": "roulette_in"}],
+    [{"text": "⏹ Выйти из чата", "callback": "roulette_out"}]
 )
 
 # ================== БАЗА ДАННЫХ ==================
@@ -470,13 +533,63 @@ def init_db():
             matched_at INTEGER DEFAULT (strftime('%s','now'))
         )
     """)
+    # ================= ТАЙМЕР =================
+    # Создаём таблицу если её нет
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
 
+    # Добавляем таймер по умолчанию 180 секунд (3 минуты)
+    cursor.execute("""
+        INSERT OR IGNORE INTO bot_settings (key, value)
+        VALUES ('chat_timer', '180')
+    """)
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT NOT NULL,
+        payment_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        days INTEGER,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
 
     conn.commit()
     conn.close()
 
     print("✅ Все таблицы и колонки созданы/проверены")
 
+# ------------------ Работа с таймером ------------------
+# Функция для установки таймера
+def set_chat_timer(seconds):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES ('chat_timer', ?)", (str(seconds),))
+    conn.commit()
+    conn.close()
+    
+
+# Функция для получения текущего значения таймера
+def get_chat_timer():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM bot_settings WHERE key='chat_timer'")
+    row = cursor.fetchone()
+    conn.close()
+    return int(row[0]) if row else 300
+    
+def check_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM bot_settings WHERE key='chat_timer'")
+    row = cursor.fetchone()
+    conn.close()
+    print(f"Значение таймера в базе данных: {row[0]}")  # Выведет текущее значение таймера
 
 # ------------------ Работа с профилями ------------------
 def get_profile(user_id):
@@ -628,6 +741,20 @@ def log_match(user_id, partner_id):
     conn.commit()
     conn.close()
 
+def activate_vip(user_id, days):
+    vip_time = datetime.now() + timedelta(days=days)
+    vip_until_str = vip_time.strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE profiles SET is_vip=1, vip_until=? WHERE user_id=?",
+        (vip_until_str, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+
   
 # ================== УНИВЕРСАЛЬНЫЙ ВЫБОР ГОРОДА ==================
 def send_city_selection(ctx, text, limit=5):
@@ -770,6 +897,8 @@ def vip_active(profile):
 
 # Функция для автоматического отключения чата
 def auto_leave_if_non_vip(user_id, partner_id):
+    # === СТАТИСТИКА: запуск поиска ===
+    increment_stat(user_id, "roulette_joins")
     time.sleep(180)  # Ждём 3 минуты (180 секунд)
     profile = get_profile(user_id)
     partner_profile = get_profile(partner_id)
@@ -798,11 +927,22 @@ def auto_leave_if_non_vip(user_id, partner_id):
 
 
 def is_vip(profile):
-    return vip_active(profile)
+    """
+    Проверяет активность VIP-подписки у пользователя.
+    """
+    vip_until = profile.get("vip_until")
+    if not vip_until:
+        return False
+    try:
+        vip_time = datetime.strptime(vip_until, "%Y-%m-%d %H:%M:%S")
+        return datetime.now() < vip_time
+    except ValueError:
+        return False
 
 
 def chat_timer(u1, u2):
-    time.sleep(180)
+    timer_seconds = get_chat_timer()
+    time.sleep(timer_seconds)
 
     if active_chats.get(u1) != u2:
         return
@@ -816,19 +956,16 @@ def chat_timer(u1, u2):
     active_chats.pop(u1, None)
     active_chats.pop(u2, None)
 
-    chat_started_at.pop(u1, None)
-    chat_started_at.pop(u2, None)
-
     msg = (
-        "⏳ Общение завершено (3 минуты)\n\n"
-        "💎 Оформите VIP для общения без ограничений"
+        "⏳ Время вышло. Ваш диалог автоматически завершен."
+        "\n💎 Хотите продолжать разговоры без временных ограничений?"
+        "Оформите VIP-подписку!"
     )
 
     if u1 in contexts:
         contexts[u1].reply(msg, keyboard=vip_menu())
     if u2 in contexts:
         contexts[u2].reply(msg, keyboard=vip_menu())
-
 
 
 def intellectmoney_link(order_id: str, amount: float, client_email: str) -> str:
@@ -864,11 +1001,33 @@ def intellectmoney_link(order_id: str, amount: float, client_email: str) -> str:
 
 
 
-
-
- 
-# ================== ОБРАБОТКА ВВОДА ГОРОДА ==================
+# ================== ОБРАБОТЧИК ==================
 @bot.on("message_created")
+#Установка таймера в админке
+def handle_timer_input(ctx):
+    state = user_states.get(str(ctx.chat_id))
+    if state != "waiting_timer":
+        return  # пользователь не в режиме ввода таймера
+
+    # безопасно получаем текст
+    text = ctx.message.get("body", {}).get("text")
+    if not text or not text.isdigit():
+        ctx.reply("⛔ Пожалуйста, введите число секунд (10-3600).")
+        return
+
+    seconds = int(text)
+    if seconds < 10 or seconds > 3600:
+        ctx.reply("⛔ Таймер должен быть от 10 до 3600 секунд. Попробуйте ещё раз.")
+        return
+
+    # сохраняем в базу
+    set_chat_timer(seconds)
+    ctx.reply(f"✅ Таймер успешно обновлён: {seconds} секунд")
+
+    # сбрасываем состояние
+    user_states.pop(str(ctx.chat_id), None)
+
+
 def relay(ctx):
     user_id = str(ctx.chat_id)
     contexts[user_id] = ctx
@@ -919,7 +1078,6 @@ def text_steps(ctx):
 
     text = ctx.message.get("text") or ctx.message.get("body", {}).get("text", "")
     attachments = ctx.message.get("body", {}).get("attachments", [])
-
 
 
     # -------- Имя --------
@@ -1305,6 +1463,7 @@ def callback_handler(ctx):
 @bot.on("message_callback")
 def handle_callback(ctx):
     chat_id = str(ctx.chat_id)
+    data = ctx.payload
     payload = ctx.payload
     update_last_activity(chat_id)
     users.setdefault(chat_id, {"step": None})
@@ -1441,13 +1600,7 @@ def handle_callback(ctx):
     elif ctx.payload == "admin_panel":
         #Админ панель
         show_admin_panel(ctx)
-    elif ctx.payload == "admin_vip_on":
-        activate_vip(chat_id, 3650)
-        show_admin_panel(ctx)
 
-    elif ctx.payload == "admin_vip_off":
-        remove_vip(chat_id)
-        show_admin_panel(ctx)
 
     elif ctx.payload == "admin_refresh":
         show_admin_panel(ctx)
@@ -1737,43 +1890,40 @@ def handle_callback(ctx):
         # Пользователь отказался восстановить
         ctx.reply("❌ Анкета не восстановлена.", keyboard=restore_keyboard)
 
-    
-    
-    
-    
-    elif ctx.payload == "roulette":
-        # Рулетка
-        roulette(ctx)
-
-
-    elif ctx.payload == "leave_chat":
-        user_id = chat_id
-
-        if user_id not in active_chats:
-            ctx.reply("❌ Вы не в чате")
-            return
-
-        partner_id = active_chats.pop(user_id)
-        active_chats.pop(partner_id, None)
-
-        # Убираем из очереди
-        if user_id in queue:
-            queue.remove(user_id)
-        if partner_id in queue:
-            queue.remove(partner_id)
-
+    elif ctx.payload == "ruletka":
+        # Запуск чата-рулетки
         ctx.reply(
-            "⏹ Вы вышли из чата",
+            "💬 Чат-рулетка готова. Выберите действие:",
             keyboard=ruletka_keyboard
         )
 
-        if partner_id in contexts:
-            contexts[partner_id].reply(
-                "❗ Собеседник вышел из чата",
-                keyboard=ruletka_keyboard
-            )
+    elif ctx.payload == "roulette_in":
+        roulette_in(ctx)
 
-        return
+    elif ctx.payload == "roulette_out":
+        roulette_out(ctx)
+
+
+
+
+
+
+
+       
+
+    elif ctx.payload == "admin_timer":
+        current = get_chat_timer()
+        ctx.reply(
+            f"⏳ Текущий таймер: {current} сек.\n"
+            "Введите новое значение:"
+        )
+        # сохраняем состояние
+        user_states[str(ctx.chat_id)] = "waiting_timer"
+        
+
+
+
+
 
 
     else:
@@ -1790,135 +1940,145 @@ def handle_callback(ctx):
 
 # ================== РУЛЕТКА ==================
 @bot.command("roulette")
+#Фильтры
 def get_filters(user_id):
+    """
+    Получение фильтров пользователя из БД (город, пол).
+    Если фильтры не заданы — возвращает пустой словарь.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT filters_city, filters_gender
+        FROM profiles
+        WHERE user_id=?
+    """, (user_id,))
+    
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        return {}
+    
+    city, gender = row
+    filters = {}
+    if city:
+        filters["city"] = city
+    if gender:
+        filters["gender"] = gender
+    return filters
+
+
+
+# --------------------- Вход в чата
+# --------------------- Вход в рулетку
+def roulette_in(ctx):
+    user_id = str(ctx.chat_id)
+
+    # === Получаем профиль и фильтры из БД ===
     profile = get_profile(user_id)
     if not profile:
-        return None
+        ctx.reply("❗ Профиль не найден. Сначала заполните анкету.")
+        return
 
-    return {
-        "gender": profile.get("filters_gender"),
-        "min_age": profile.get("filters_age_min") or 18,
-        "max_age": profile.get("filters_age_max") or 99,
-        "city": profile.get("filters_city")
-    }
-
-def find_best_partner(user_id):
     filters = get_filters(user_id)
-    if not filters:
-        return None
+    if not filters or not filters.get("city"):
+        ctx.reply("❗ Выберите город в фильтрах")
+        return
 
     conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    cursor.execute("""
-        SELECT p.*
-        FROM roulette_queue q
-        JOIN profiles p ON q.user_id = p.user_id
-        WHERE q.user_id != ?
-    """, (user_id,))
+    try:
+        # === Проверка, есть ли пользователь уже в активном чате ===
+        cursor.execute(
+            "SELECT user1, user2 FROM active_chats WHERE user1=? OR user2=?",
+            (user_id, user_id)
+        )
+        if cursor.fetchone():
+            ctx.reply("❗ Вы уже в чате")
+            return
 
-    candidates = cursor.fetchall()
-    conn.close()
+        # === Проверка, есть ли пользователь в очереди ===
+        cursor.execute(
+            "SELECT 1 FROM roulette_queue WHERE user_id=?",
+            (user_id,)
+        )
+        if cursor.fetchone():
+            ctx.reply("⏳ Вы уже в очереди")
+            return
 
-    for row in candidates:
-        candidate = dict(row)
+        # === Поиск партнёра в очереди ===
+        partner_id = None
+        cursor.execute(
+            "SELECT rq.user_id FROM roulette_queue rq "
+            "JOIN profiles p ON rq.user_id=p.user_id "
+            "WHERE rq.user_id!=?",
+            (user_id,)
+        )
+        candidates = cursor.fetchall()
 
-        # Проверка пола
-        if filters["gender"] and filters["gender"] != "Любой":
-            if candidate.get("gender") != filters["gender"]:
+        for candidate in candidates:
+            cand_id = candidate[0]
+            cand_profile = get_profile(cand_id)
+            cand_filters = get_filters(cand_id)
+
+            if not cand_profile:
                 continue
 
-        # Проверка возраста
-        age = candidate.get("age")
-        if not age:
-            continue
-        if age < filters["min_age"] or age > filters["max_age"]:
-            continue
-
-        # Проверка города (СТРОГОЕ совпадение)
-        if filters["city"]:
-            if candidate.get("city") != filters["city"]:
+            # Фильтр по городу
+            if cand_profile.get("city") != filters.get("city"):
                 continue
 
-        return candidate
+            # Фильтр по полу
+            if filters.get("gender") and filters["gender"] != "Любой":
+                if cand_profile.get("gender") != filters.get("gender"):
+                    continue
 
-    return None
+            # Взаимная проверка города и пола
+            if cand_filters:
+                if cand_filters.get("city") != profile.get("city"):
+                    continue
+                if cand_filters.get("gender") and cand_filters["gender"] != "Любой":
+                    if profile.get("gender") != cand_filters["gender"]:
+                        continue
 
+            partner_id = cand_id
+            break
 
+        now = int(time.time())
 
+        if partner_id:
+            # === Создаем чат в базе и удаляем из очереди ===
+            cursor.execute(
+                "DELETE FROM roulette_queue WHERE user_id IN (?, ?)",
+                (user_id, partner_id)
+            )
+            cursor.execute(
+                "INSERT INTO active_chats (user1, user2, started_at) VALUES (?, ?, ?)",
+                (user_id, partner_id, now)
+            )
+            conn.commit()
 
-def roulette(ctx):
-    user_id = str(ctx.chat_id)
-    contexts[user_id] = ctx
+            # === Статистика ===
+            increment_stat(user_id, "chats_started")
+            increment_stat(partner_id, "chats_started")
 
-    # Уже в чате
-    if user_id in active_chats:
-        ctx.reply("❗ Вы уже в чате")
-        log.info(f"[Queue] {user_id} — уже в чате")
-        return
+            # === Сообщения участникам ===
+            user_profile = profile
+            partner_profile = get_profile(partner_id)
 
-    # Уже в очереди
-    if user_id in queue:
-        ctx.reply("⏳ Вы уже в очереди")
-        log.info(f"[Queue] {user_id} — уже в очереди")
-        return
-
-    # Проверка фильтров (город выбран)
-    profile = get_profile(user_id)
-    filters = get_filters(user_id)  # твоя функция получения фильтров
-    if not filters.get("city"):
-        ctx.reply("❗ Выберите город в фильтрах, чтобы искать собеседника")
-        log.info(f"[Queue] {user_id} — нет города в фильтрах")
-        return
-
-    # Ищем подходящего партнёра
-    partner = find_best_partner(user_id)
-    if partner:
-        partner_id = partner["user_id"]
-
-        # Убираем партнёра из очереди
-        if partner_id in queue:
-            queue.remove(partner_id)
-            remove_from_queue(partner_id)
-
-        active_chats[user_id] = partner_id
-        active_chats[partner_id] = user_id
-
-        now = time.time()
-        chat_started_at[user_id] = now
-        chat_started_at[partner_id] = now
-
-        # Логи соединения
-        log.info(f"[Connect] {user_id} ↔ {partner_id}")
-
-        # Уведомления пользователей
-        ctx.reply("✨ Собеседник найден! Начните общение 👋")
-        if partner_id in contexts:
-            contexts[partner_id].reply("✨ Собеседник найден! Начните общение 👋")
-
-        # Логируем поиск и матч
-        log_search(user_id)
-        log_search(partner_id)
-        log_match(user_id, partner_id)
-
-        # Подготовка анкет
-        user_profile = get_profile(user_id)
-        partner_profile = get_profile(partner_id)
-
-        def get_emoji(profile):
-            if not profile:
+            def get_emoji(p):
+                if not p: return "👤"
+                if p.get("gender") == "М": return "👨"
+                if p.get("gender") == "Ж": return "👩"
                 return "👤"
-            if profile.get("gender") == "М":
-                return "👨"
-            if profile.get("gender") == "Ж":
-                return "👩"
-            return "👤"
 
-        leave_keyboard = InlineKeyboard([{"text": "⏹ Выйти из чата", "callback": "leave_chat"}])
+            leave_keyboard = InlineKeyboard(
+                [{"text": "⏹ Выйти из чата", "callback": "roulette_out"}]
+            )
 
-        # Анкета партнёра пользователю
-        if partner_profile:
             ctx.reply(
                 f"{get_emoji(partner_profile)} Анкета собеседника:\n\n"
                 f"Имя: {partner_profile.get('name')}\n"
@@ -1927,47 +2087,123 @@ def roulette(ctx):
                 f"🎈 Возраст: {partner_profile.get('age')}\n"
                 f"🏙 Город: {partner_profile.get('city')}\n"
                 f"✍️ О себе: {partner_profile.get('about')}\n"
-                f"💎 VIP: {'да' if is_vip(partner_profile) else 'нет'}\n"
+                f"💎 VIP: {'да' if partner_profile.get('is_vip') else 'нет'}\n"
                 f"📸 Фото:\n{partner_profile.get('photo_url')}",
                 keyboard=leave_keyboard
             )
 
-        # Анкета пользователя партнёру
-        if user_profile and partner_id in contexts:
-            contexts[partner_id].reply(
-                f"{get_emoji(user_profile)} Анкета собеседника:\n\n"
-                f"Имя: {user_profile.get('name')}\n"
-                f"Пол: {user_profile.get('gender')}\n"
-                f"🎂 Дата рождения: {user_profile.get('birthdate')}\n"
-                f"🎈 Возраст: {user_profile.get('age')}\n"
-                f"🏙 Город: {user_profile.get('city')}\n"
-                f"✍️ О себе: {user_profile.get('about')}\n"
-                f"💎 VIP: {'да' if is_vip(user_profile) else 'нет'}\n"
-                f"📸 Фото:\n{user_profile.get('photo_url')}",
-                keyboard=leave_keyboard
+            if partner_id in contexts:
+                contexts[partner_id].reply(
+                    f"{get_emoji(user_profile)} Анкета собеседника:\n\n"
+                    f"Имя: {user_profile.get('name')}\n"
+                    f"Пол: {user_profile.get('gender')}\n"
+                    f"🎂 Дата рождения: {user_profile.get('birthdate')}\n"
+                    f"🎈 Возраст: {user_profile.get('age')}\n"
+                    f"🏙 Город: {user_profile.get('city')}\n"
+                    f"✍️ О себе: {user_profile.get('about')}\n"
+                    f"💎 VIP: {'да' if user_profile.get('is_vip') else 'нет'}\n"
+                    f"📸 Фото:\n{user_profile.get('photo_url')}",
+                    keyboard=leave_keyboard
+                )
+
+            # === Запускаем таймер чата через БД ===
+            threading.Thread(
+                target=chat_timer,
+                args=(user_id, partner_id),
+                daemon=True
+            ).start()
+
+            ctx.reply("✨ Собеседник найден! Начните общение 👋")
+
+        else:
+            # === Никого нет — добавляем в очередь ===
+            cursor.execute(
+                "INSERT INTO roulette_queue (user_id, joined_at) VALUES (?, ?)",
+                (user_id, now)
+            )
+            conn.commit()
+            ctx.reply("🔎 Ищем собеседника...")
+
+    finally:
+        conn.close()
+
+
+# --------------------- Выход из чата
+def roulette_out(ctx):
+    user_id = str(ctx.chat_id)
+    partner_id = None
+
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+
+        # === Проверяем активный чат ===
+        cursor.execute(
+            "SELECT user1, user2 FROM active_chats WHERE user1=? OR user2=?",
+            (user_id, user_id)
+        )
+        row = cursor.fetchone()
+
+        if row:
+            user1, user2 = row
+            partner_id = user2 if user1 == user_id else user1
+
+            # Удаляем активный чат
+            cursor.execute(
+                "DELETE FROM active_chats WHERE user1=? OR user2=?",
+                (user_id, user_id)
+            )
+            conn.commit()
+
+            # Обновляем статистику
+            increment_stat(user_id, "chats_finished")
+            if partner_id:
+                increment_stat(partner_id, "chats_finished")
+
+            # Сообщение пользователю
+            ctx.reply(
+                "❌ Вы вышли из чата",
+                keyboard=main_menu(get_profile(user_id))
             )
 
-    else:
-        # Если очереди нет — добавляем пользователя в очередь
-        add_to_queue(user_id)
-        queue.append(user_id)
-        log.info(f"[Queue] {user_id} — ожидает собеседника")
-        ctx.reply("🔎 Ищем собеседника...")
+            # Сообщение партнёру (если он онлайн)
+            if partner_id and partner_id in contexts:
+                contexts[partner_id].reply(
+                    "❗ Ваш собеседник вышел из чата",
+                    keyboard=main_menu(get_profile(partner_id))
+                )
 
+            # Очистка локальных структур
+            contexts.pop(user_id, None)
+            user_states.pop(user_id, None)
+            return
 
+        # === Проверяем очередь ===
+        cursor.execute(
+            "SELECT 1 FROM roulette_queue WHERE user_id=?",
+            (user_id,)
+        )
+        if cursor.fetchone():
+            cursor.execute(
+                "DELETE FROM roulette_queue WHERE user_id=?",
+                (user_id,)
+            )
+            conn.commit()
+            ctx.reply(
+                "❌ Вы вышли из очереди",
+                keyboard=main_menu(get_profile(user_id))
+            )
+            return
 
-@bot.command("leave")
-def leave_chat(ctx):
-    user_id = str(ctx.chat_id)
-    if user_id not in active_chats:
-        ctx.reply("❌ Вы не в чате")
-        return
-    partner_id = active_chats.pop(user_id)
-    active_chats.pop(partner_id, None)
-    ctx.reply("❌ Вы вышли из чата")
-    if partner_id in contexts:
-        contexts[partner_id].reply("❗ Собеседник вышел из чата")
-		
+        # === Пользователь нигде не был ===
+        ctx.reply(
+            "❌ Вы не в чате и не в очереди",
+            keyboard=main_menu(get_profile(user_id))
+        )
+
+    finally:
+        conn.close()
+
 
 # ================== АДМИН ПАНЕЛЬ ==================
 
@@ -2012,7 +2248,7 @@ def show_admin_panel(ctx):
 
     # ------------------ Кнопки ------------------
 
-
+    
 def admin_keyboard(profile):
     if is_vip(profile):
         vip_button = {"text": "❌ Отключить VIP (у меня)", "callback": "admin_vip_off"}
@@ -2021,9 +2257,41 @@ def admin_keyboard(profile):
 
     return InlineKeyboard(
         [vip_button],
+        [{"text": "⏳ Таймер чата", "callback": "admin_timer"}], 
         [{"text": "🔄 Обновить", "callback": "admin_refresh"}],
         [{"text": "⬅ Назад", "callback": "back"}]
     )
+
+
+
+
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -2098,14 +2366,47 @@ def get_stats():
     conn.close()
     return stats
 
+def ensure_stats(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR IGNORE INTO roulette_stats (user_id) VALUES (?)",
+        (user_id,)
+    )
+    conn.commit()
+    conn.close()
 
+def log_search(user_id):
+    ensure_stats(user_id)
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE roulette_stats SET searches = searches + 1 WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
 
+def log_match(user_id):
+    ensure_stats(user_id)
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE roulette_stats SET matches = matches + 1 WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
 
+def log_chat_started(user_id):
+    ensure_stats(user_id)
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE roulette_stats SET chats_started = chats_started + 1 WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
 
-
-# ================== ЗАПУСК ПУЛЛИНГА В ОТДЕЛЬНОМ ПОТОКЕ ==================
-    Thread(target=poll_payments, daemon=True).start()
-
+def log_chat_ended(user_id):
+    ensure_stats(user_id)
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE roulette_stats SET chats_ended = chats_ended + 1 WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
 
 
 
