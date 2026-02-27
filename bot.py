@@ -2,6 +2,10 @@ import sqlite3
 import logging
 import threading
 import time
+import asyncio
+import redis.asyncio as redis
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple
 from datetime import datetime, timedelta
 from maxgram import Bot
 from maxgram.keyboards import InlineKeyboard
@@ -12,6 +16,7 @@ import urllib.parse
 import sys
 import subprocess
 import random
+from config import BOT_USERNAME
 #from payment import create_payment_link
 
 # ================== ЛОГИ ==================
@@ -19,6 +24,7 @@ import random
 # Настройки логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - BOT - %(levelname)s - %(message)s")
 log = logging.getLogger("BOT")
+
 
 # ================== ИНИЦИАЛИЗАЦИЯ БОТА ==================
 bot = Bot(TOKEN)
@@ -33,8 +39,6 @@ active_chats = {}              # Активные чаты рулетки: user_
 contexts = {}                  # Контексты пользователей для рулетки: user_id -> ctx
 chat_started_at = {}           # 👈 ВАЖНО (у тебя из-за этого была ошибка)
 buh_process = None             # глобальная переменная для процесса buh.py
-bot.user_states = {}
-pending_payments = {}
 # Настройка YooKassa
 Configuration.account_id = YOOKASSA_SHOP_ID
 Configuration.secret_key = YOOKASSA_SECRET_KEY
@@ -44,85 +48,127 @@ TARIFFS = {
     "vip_180": {"days": 180, "price": 1500, "name": "VIP 6 месяцев"},
     "vip_365": {"days": 365, "price": 2500, "name": "VIP 12 месяцев"},
 }
+# ================= REDIS =================
+redis_client = redis.Redis(
+    host="localhost",
+    port=6379,
+    db=0,
+    decode_responses=True
+)
+QUEUE_KEY = "roulette_queue"
+async def start_chat(user1, user2):
+    active_chats[user1] = user2
+    active_chats[user2] = user1
+    print(f"[CHAT STARTED] {user1} ↔ {user2}")
+    
+ZODIAC_SIGNS = {
+    "Овен": "♈",
+    "Телец": "♉",
+    "Близнецы": "♊",
+    "Рак": "♋",
+    "Лев": "♌",
+    "Дева": "♍",
+    "Весы": "♎",
+    "Скорпион": "♏",
+    "Стрелец": "♐",
+    "Козерог": "♑",
+    "Водолей": "♒",
+    "Рыбы": "♓",
+}
 
-def poll_payments():
+def poll_payments_api_YOOKASSA():
+    """
+    Поток проверки платежей через YooKassa API.
+    Каждые 30 секунд проверяет платежи со статусом 'pending'.
+    Если платёж успешен, активирует VIP и отправляет главное меню.
+    """
     while True:
+        conn = None
         try:
             conn = sqlite3.connect(DB_FILE)
             cursor = conn.cursor()
 
             # Берём все pending платежи
-            cursor.execute("SELECT id, chat_id, days FROM payments WHERE status='pending'")
+            cursor.execute(
+                "SELECT id, chat_id, payment_id, days FROM payments WHERE status='pending'"
+            )
             payments = cursor.fetchall()
 
-            for payment in payments:
-                payment_id, chat_id, days = payment
+            for db_id, chat_id, payment_id, days in payments:
+                try:
+                    payment_info = Payment.get(payment_id)
+                    status = payment_info.status  # "pending", "succeeded", "canceled"
+                except Exception as e:
+                    logging.error(f"YooKassa API error for {payment_id}: {e}")
+                    continue
 
-                cursor.execute("UPDATE payments SET status='done' WHERE id=?", (payment_id,))
+                if status != "succeeded":
+                    continue  # Платёж ещё не выполнен
+
+                # ✅ Обновляем статус платежа
+                cursor.execute("UPDATE payments SET status='done' WHERE id=?", (db_id,))
                 conn.commit()
 
-                activate_vip(chat_id, days * 24 * 3600)
-                bot.send_message(chat_id, "✅ Ваш VIP активирован после платежа!")
+                # ✅ Активируем VIP
+                profile = get_profile(chat_id)
+                if profile:
+                    activate_vip_for_profile(profile, days)
 
-        except Exception as e:
-            print("Ошибка в poll_payments:", e)
+                    cursor.execute(
+                        "UPDATE profiles SET vip_until=? WHERE user_id=?",
+                        (profile["vip_until"], profile["user_id"])
+                    )
+                    conn.commit()
+
+                    # ✅ Уведомляем пользователя через API и отправляем главное меню
+                    try:
+                        text, keyboard = main_menu(profile, chat_id)
+                        bot.api.send_message(
+                            chat_id,
+                            f"🎉 VIP активирован на {days} дней!\n\nСпасибо за поддержку ❤️\n\n{text}",
+                            keyboard=keyboard
+                        )
+                    except Exception as e:
+                        logging.error(f"poll_payments_api_YOOKASSA error: {e}")
+
         finally:
-            conn.close()
+            if conn:
+                conn.close()
 
-        time.sleep(60)
+        time.sleep(30)  # проверка каждые 30 секунд
 
+# ================== Запуск матчмейкера ==================
+async def start_matchmaker():
+    asyncio.create_task(matchmaker())
 
-
-# ------------------- Запуск потока -------------------
-# Вставить один раз после создания объекта bot
-threading.Thread(target=poll_payments, daemon=True).start()
-
-
-# ------------------ Статистика пользователей ------------------
-def increment_stat(user_id, field):
-    """
-    Увеличивает поле статистики на 1 для пользователя.
-    Поля могут быть:
-      - 'roulette_joins'  — вход в очередь рулетки
-      - 'chats_started'   — начало чата
-      - 'chats_finished'  — завершение чата
-    """
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    # Проверяем, есть ли запись пользователя
-    cursor.execute("SELECT 1 FROM stats WHERE user_id=?", (user_id,))
-    if cursor.fetchone() is None:
-        # Если нет, создаём запись с нулями
-        cursor.execute(
-            "INSERT INTO stats (user_id, roulette_joins, chats_started, chats_finished) VALUES (?, 0, 0, 0)",
-            (user_id,)
-        )
-
-    # Увеличиваем нужное поле на 1
-    cursor.execute(
-        f"UPDATE stats SET {field} = {field} + 1 WHERE user_id=?",
-        (user_id,)
-    )
-    conn.commit()
-    conn.close()
 
 
 # ================== КЛАВИАТУРЫ ==================
-
-# Главное меню анкеты
+# Главное меню
 def main_menu(profile=None, chat_id=None):
-    """
-    Формирует главное меню для пользователя.
-    profile — словарь профиля (может быть None)
-    chat_id — id пользователя (может быть None, тогда берется из profile)
-    """
+# Реальные числа из базы
+    stats = get_stats()
+    girls = 412
+    boys = 230
 
-    # Если chat_id не передан, пробуем взять из profile
-    if not chat_id and profile:
-        chat_id = profile.get("user_id")
+# Суммарные числа (реальные + из базы)
+    girls_total = girls + stats.get('users_f', 0)
+    boys_total = boys + stats.get('users_m', 0)
 
-    # Выбираем эмодзи по полу
+# Онлайн = примерно половина суммарных пользователей + разброс
+    online_total = (girls_total + boys_total) // 2 + random.randint(-15, 15)
+
+# Ограничиваем, чтобы не выйти за реальные пределы
+    online_total = max(1, min(online_total, girls_total + boys_total))
+
+# Заголовок
+    header_text = (
+        f"🔥 Онлайн прямо сейчас: {online_total} человек\n"
+        f"👩 Девушек всего: {girls_total}\n"
+        f"👨 Парней всего: {boys_total}"
+    )
+
+
     emoji = "👤"
     if profile:
         if profile.get("gender") == "М":
@@ -131,34 +177,30 @@ def main_menu(profile=None, chat_id=None):
             emoji = "👩"
 
     buttons = [
-        [{"text": "⭐ VIP", "callback": "vip"}],
-        [{"text": f"{emoji} Анкета", "callback": "open_profile"}],
-        [{"text": "🎯 Фильтры", "callback": "open_filters"}],
-        [{"text": "🎲 Рулетка", "callback": "ruletka"}],
-        [{"text": "🧠 GigaChat", "url": "https://max.ru/gigachat"}], 
-        [{"text": "💋 Магазин 18+", "url": "https://my.saleads.pro/s/mifwJ?erid=2VtzqxeqeeQ"}],
+        [{"text": "🎲 Начать общение", "callback": "ruletka"}],
+        [{"text": "💎 VIP без ограничений", "callback": "vip"}],
+        [{"text": f"{emoji} Моя анкета", "callback": "open_profile"}],
+        [{"text": "🎯 Фильтры (VIP)", "callback": "open_filters"}],
+        [{"text": "📩 Пригласить друзей 🎁", "callback": "invite"}],
         [{"text": "🆘 Поддержка", "url": SUPPORT_URL}],
     ]
 
-    # Добавляем кнопку админ-панель только если chat_id соответствует ADMIN_ID
     if chat_id and str(chat_id) == str(ADMIN_ID):
         buttons.append([{"text": "⚙ Админ панель", "callback": "admin_panel"}])
 
-    return InlineKeyboard(*buttons)
+    keyboard = InlineKeyboard(*buttons)
+    return header_text, keyboard   
+    
+
+# ================== Сохранение профиля ==================
+save_menu = InlineKeyboard(
+    [
+        {"text": "Сохранить анкету", "callback": "save"},
+        {"text": "Главное меню", "callback": "main_menu"}
+    ]
+)
 
 
-# ================== Клавиатуры ==================
-def main_menu_kb(profile):
-    kb = InlineKeyboard()
-    kb.add_button("💎 Купить VIP", payload="vip_pay")
-    return kb
-
-    age_keyboard = InlineKeyboard()
-    age_keyboard.add_button("Да", payload="age_yes")
-    age_keyboard.add_button("Нет", payload="age_no")
-
-    restore_keyboard = InlineKeyboard()
-    restore_keyboard.add_button("Восстановить", payload="restore_profile")
 
 
 
@@ -196,6 +238,8 @@ vip_tarif_keyboard = InlineKeyboard(
     [{"text": "💳 VIP 12 месяцев — 2500 ₽", "callback": "vip_365"}],
     [{"text": "⬅️ Назад", "callback": "back"}]
 	)
+
+
 
 # Клавиатура оферты VIP
 vip_offer_keyboard = InlineKeyboard(
@@ -285,6 +329,11 @@ OFFER_TEXT = """
 ОГРНИП: 324420500025722
 """
 
+
+
+
+ 
+
 # Клавиатура проверки возраста
 age_keyboard = InlineKeyboard([
     {"text": "✅ Да, мне есть 18", "callback": "age_yes"},
@@ -297,32 +346,67 @@ gender_keyboard = InlineKeyboard([
     {"text": "👩 Женский", "callback": "gender_f"},
 ])
 
-# Меню редактирования анкеты
-edit_keyboard = InlineKeyboard(
-    [{"text": "📝 Имя", "callback": "edit_name"},
-     {"text": "⚧ Пол", "callback": "edit_gender"}],
-    [{"text": "🎂 Дата рождения", "callback": "edit_birthdate"},
-     {"text": "🏙 Город", "callback": "edit_city"}],
-    [{"text": "✍️ О себе", "callback": "edit_about"},
-     {"text": "📸 Фото", "callback": "edit_photo"}],
-    [{"text": "👍 Готово", "callback": "edit_done"}]
-)
 
-# Меню редактирования анкеты
-edit_save = InlineKeyboard(
-    [{"text": "📝 Имя", "callback": "edit_name"},
-     {"text": "⚧ Пол", "callback": "edit_gender"}],
-    [{"text": "🎂 Дата рождения", "callback": "edit_birthdate"},
-     {"text": "🏙 Город", "callback": "edit_city"}],
-    [{"text": "✍️ О себе", "callback": "edit_about"},
-     {"text": "📸 Фото", "callback": "edit_photo"}],
-    [{"text": "👍 Готово", "callback": "edit_save"}]
-)
+
+
+
+
+
+
+
+def get_edit_keyboard(is_saved=False):
+    """
+    Возвращает клавиатуру редактирования анкеты.
+    is_saved=False -> редактируем новую анкету (создание)
+    is_saved=True -> редактируем существующую анкету (профиль)
+    """
+    last_button = {
+        "text": "👍 Готово 2" if is_saved else "👍 Готово 1",
+        "callback": "edit_save_profile" if is_saved else "edit_done_create"
+    }
+
+    print(f"[DEBUG] Создаётся клавиатура редактирования, is_saved={is_saved}")
+    print(f"[DEBUG] Кнопка 'Готово': text='{last_button['text']}', callback='{last_button['callback']}'")
+
+    return InlineKeyboard(
+        [{"text": "📝 Имя", "callback": "edit_name_profile" if is_saved else "edit_name_save"},
+         {"text": "⚧ Пол", "callback": "edit_gender_profile" if is_saved else "edit_gender_save"}],
+        [{"text": "🎂 Дата рождения", "callback": "edit_birthdate_profile" if is_saved else "edit_birthdate_save"},
+         {"text": "🏙 Город", "callback": "edit_city_profile" if is_saved else "edit_city_save"}],
+        [{"text": "✍️ О себе", "callback": "edit_about_profile" if is_saved else "edit_about_save"},
+         {"text": "📸 Фото", "callback": "edit_photo_profile" if is_saved else "edit_photo_save"}],
+        [last_button]
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # Меню после заполнения анкеты
 save_menu = InlineKeyboard([
     {"text": "💾 Сохранить ✅", "callback": "save"},
-    {"text": "✏️ Редактировать", "callback": "edit"},
+    {"text": "✏️ Редактировать", "callback": "edit_profile_after_creation"},
     {"text": "🗑 Удалить", "callback": "delete"}
 ])
 
@@ -352,60 +436,15 @@ restore_keyboard = InlineKeyboard([
 ])
 
 
-
-# Фильтры
-MIN_AGE_LIMIT = 18
-MAX_AGE_LIMIT = 100
-
-# Главное меню фильтров
-def keyboard_filters(profile=None):
-    return InlineKeyboard(
-        [
-            {"text": "Пол", "callback": "gender_filters"},
-            {"text": "Возраст", "callback": "age_filters"},
-            {"text": "Город", "callback": "city_filters"},
-        ],
-        [
-            {"text": "Готово 👍", "callback": "done_filters"}
-        ]
-    )
-
-# Пол фильтр
-gender_filters = InlineKeyboard(
-    [
-        {"text": "👨 Мужской", "callback": "gender_filter_m"},
-        {"text": "👩 Женский", "callback": "gender_filter_f"}
-    ],
-    [
-        {"text": "🎭 Любой", "callback": "gender_filter_any"}
-    ]
-)
-
-# Возраст
-def age_keyboard_filters(min_age, max_age):
-    return InlineKeyboard(
-        [
-            {"text": "⬅️ Мин -1", "callback": "age_min_minus"},
-            {"text": f"{min_age}", "callback": "noop"},
-            {"text": "Мин +1 ➡️", "callback": "age_min_plus"},
-        ],
-        [
-            {"text": "⬅️ Макс -1", "callback": "age_max_minus"},
-            {"text": f"{max_age}", "callback": "noop"},
-            {"text": "Макс +1 ➡️", "callback": "age_max_plus"},
-        ],
-        [
-            {"text": "✅ Готово", "callback": "done_filters"}
-        ]
-    )
-
-
 # Клавиатура VIP
 def vip_menu():
     return InlineKeyboard(
         [{"text": "💎 Оформить VIP", "callback": "vip"}],
         [{"text": "⬅️ В меню", "callback": "back"}]
     )
+
+
+
 
 # Клавиатура рулетки
 ruletka_keyboard = InlineKeyboard(
@@ -414,6 +453,8 @@ ruletka_keyboard = InlineKeyboard(
 )
 
 # ================== БАЗА ДАННЫХ ==================
+# ------------------ Создание базы и профилей ------------------
+
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -441,7 +482,9 @@ def init_db():
             filters_city TEXT DEFAULT 'Любой',
             filters_region TEXT DEFAULT 'Любой',
             is_subscribed INTEGER DEFAULT 0,
-            subscription_expire TEXT DEFAULT NULL
+            subscription_expire TEXT DEFAULT NULL,
+            invited_by TEXT DEFAULT NULL,
+            invites INTEGER DEFAULT 0
         );
     """)
 
@@ -455,6 +498,7 @@ def init_db():
     cursor.execute("PRAGMA table_info(profiles);")
     existing_columns = [col[1] for col in cursor.fetchall()]
 
+    # Добавляем недостающие колонки
     for column, definition in columns_to_add.items():
         if column not in existing_columns:
             cursor.execute(f"ALTER TABLE profiles ADD COLUMN {column} {definition};")
@@ -466,7 +510,7 @@ def init_db():
             user1 TEXT,
             user2 TEXT,
             started_at INTEGER DEFAULT (strftime('%s','now'))
-        )
+        );
     """)
 
     # ================= РУЛЕТКА =================
@@ -474,7 +518,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS roulette_queue (
             user_id TEXT PRIMARY KEY,
             joined_at INTEGER
-        )
+        );
     """)
 
     cursor.execute("""
@@ -484,7 +528,7 @@ def init_db():
             user_id TEXT,
             event TEXT,
             partner_id TEXT
-        )
+        );
     """)
 
     cursor.execute("""
@@ -494,7 +538,7 @@ def init_db():
             min_age INTEGER DEFAULT NULL,
             max_age INTEGER DEFAULT NULL,
             city TEXT DEFAULT NULL
-        )
+        );
     """)
 
     # ================= ИСТОРИЯ ПОИСКА =================
@@ -503,8 +547,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT,
             searched_at INTEGER DEFAULT (strftime('%s','now'))
-        )
+        );
     """)
+
     # ================= ИСТОРИЯ МАТЧЕЙ =================
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS match_history (
@@ -512,62 +557,76 @@ def init_db():
             user1_id TEXT,
             user2_id TEXT,
             matched_at INTEGER DEFAULT (strftime('%s','now'))
-        )
+        );
     """)
+
     # ================= ТАЙМЕР =================
     # Создаём таблицу если её нет
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS bot_settings (
             key TEXT PRIMARY KEY,
             value TEXT
-        )
+        );
     """)
 
     # Добавляем таймер по умолчанию 180 секунд (3 минуты)
     cursor.execute("""
         INSERT OR IGNORE INTO bot_settings (key, value)
-        VALUES ('chat_timer', '180')
-    """)
-    
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id TEXT NOT NULL,
-        payment_id TEXT NOT NULL,
-        status TEXT NOT NULL,
-        days INTEGER,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    
-    # Таблица статистики
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS stats (
-        user_id TEXT PRIMARY KEY,
-        chats_started INTEGER DEFAULT 0,
-        chats_finished INTEGER DEFAULT 0,
-        roulette_joins INTEGER DEFAULT 0
-    )
+        VALUES ('chat_timer', '180');
     """)
 
-    # Таблица платежей
+    # ================= РЕФЕРАЛЫ =================
     cursor.execute("""
-    CREATE TABLE IF NOT EXISTS payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id TEXT NOT NULL,
-        payment_id TEXT NOT NULL,
-        status TEXT NOT NULL,
-        days INTEGER,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
+        CREATE TABLE IF NOT EXISTS referrals (
+            inviter_id TEXT,
+            invited_id TEXT UNIQUE
+        )
     """)
 
+    # ================= ПРОВЕРКА НА НЕДОСТАЮЩИЕ КОЛОНКИ =================
+    cursor.execute("PRAGMA table_info(profiles)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "vip_until" not in columns:
+        cursor.execute("ALTER TABLE profiles ADD COLUMN vip_until TEXT")
+        cursor.execute("PRAGMA table_info(profiles);")
+        columns = [col[1] for col in cursor.fetchall()]
+        print("✅ Колонка vip_until добавлена")
+
+    if "invites" not in columns:
+        cursor.execute("ALTER TABLE profiles ADD COLUMN invites INTEGER DEFAULT 0")
+        print("Добавлена колонка: invites")
+
+    # Коммитим изменения
     conn.commit()
     conn.close()
 
     print("✅ Все таблицы и колонки созданы/проверены")
 
 # ------------------ Работа с таймером ------------------
+def get_referral_progress(user_id):
+    invited_users = get_users_invited_by(user_id)
+    unique_friends = {u['chat_id'] for u in invited_users}
+    total = len(unique_friends)
+
+    progress = total % 3  # сколько сейчас в текущем цикле (0,1,2)
+    return total, progress
+    
+def get_invites(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT invites FROM profiles WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def add_invite(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE profiles SET invites = invites + 1 WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
 # Функция для установки таймера
 def set_chat_timer(seconds):
     conn = sqlite3.connect(DB_FILE)
@@ -575,7 +634,8 @@ def set_chat_timer(seconds):
     cursor.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES ('chat_timer', ?)", (str(seconds),))
     conn.commit()
     conn.close()
-    
+    log.info(f"Таймер обновлён на {seconds} секунд")
+
 # Функция для получения текущего значения таймера
 def get_chat_timer():
     conn = sqlite3.connect(DB_FILE)
@@ -591,19 +651,48 @@ def check_db():
     cursor.execute("SELECT value FROM bot_settings WHERE key='chat_timer'")
     row = cursor.fetchone()
     conn.close()
-    print(f"Значение таймера в базе данных: {row[0]}")  # Выведет текущее значение таймера
+   
 
 # ------------------ Работа с профилями ------------------
 def get_profile(user_id):
     conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM profiles WHERE user_id=?", (user_id,))
+    cursor.execute("""
+        SELECT user_id, name, gender, birthdate, age, city, about, photo_url,
+               filters_gender, filters_age_min, filters_age_max, filters_city
+        FROM profiles
+        WHERE user_id=?
+    """, (user_id,))
     row = cursor.fetchone()
     conn.close()
-    return dict(row) if row else None
+    if not row:
+        return None
 
-def save_profile(user_id, data):
+    (user_id, name, gender, birthdate, age, city, about, photo_url,
+     filters_gender, filters_age_min, filters_age_max, filters_city) = row
+
+    return {
+        "user_id": user_id,
+        "name": name,
+        "gender": gender,
+        "birthdate": birthdate,
+        "age": age,
+        "city": city,
+        "about": about,
+        "photo_url": photo_url,
+        "filters_gender": filters_gender,
+        "filters_age_min": filters_age_min,
+        "filters_age_max": filters_age_max,
+        "filters_city": filters_city
+    }
+
+def save_profile(user_id, new_data):
+    # Получаем текущий профиль из БД
+    profile = get_profile(user_id) or {}
+
+    # Обновляем только те поля, что есть в new_data
+    profile.update(new_data)
+
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("""
@@ -612,15 +701,15 @@ def save_profile(user_id, data):
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     """, (
         user_id,
-        data.get("name"),
-        data.get("gender"),
-        data.get("birthdate"),
-        data.get("age"),
-        data.get("zodiac"),
-        data.get("city"),
-        data.get("region"),
-        data.get("about"),
-        data.get("photo_url")
+        profile.get("name"),
+        profile.get("gender"),
+        profile.get("birthdate"),
+        profile.get("age"),
+        profile.get("zodiac"),
+        profile.get("city"),
+        profile.get("region"),
+        profile.get("about"),
+        profile.get("photo_url")
     ))
     conn.commit()
     conn.close()
@@ -688,6 +777,7 @@ def save_order(order_id, user_id, days, price):
     conn.commit()
     conn.close()
 
+
 # ------------------ Фильтры ------------------
 def update_filter(user_id, field, value):
     conn = sqlite3.connect(DB_FILE)
@@ -696,6 +786,46 @@ def update_filter(user_id, field, value):
     conn.commit()
     conn.close()
     log.info(f"🔧 filter {field}={value} saved for {user_id}")
+    
+def filter(user_id, field, value):
+    user_id = str(user_id)
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        f"UPDATE profiles SET {field}=? WHERE user_id=?",
+        (value, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+    log.info(f"🔧 filter {field}={value} saved for {user_id}")
+    
+def get_filters(user_id):
+    user_id = str(user_id)
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT filters_city, filters_region, filters_gender, filters_age_min, filters_age_max
+        FROM profiles
+        WHERE user_id=?
+    """, (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return {}
+
+    city, region, gender, age_min, age_max = row
+
+    return {
+        "city": city or "Любой",
+        "region": region or "Любой",
+        "gender": gender or "Любой",
+        "age_min": age_min if age_min is not None else 18,
+        "age_max": age_max if age_max is not None else 35
+    }
 
 
 # ------------------ Очередь рулетки ------------------
@@ -755,7 +885,444 @@ def activate_vip(user_id, days):
     conn.commit()
     conn.close()
 
-  
+
+#==================ФИЛЬТРЫ==========================================
+MIN_AGE_LIMIT = 18
+MAX_AGE_LIMIT = 100
+
+gender_filters = InlineKeyboard(
+    [
+        {"text": "👨 Мужчины", "callback": "gender_filter_m"},
+        {"text": "👩 Женщины", "callback": "gender_filter_f"},
+    ],
+    [
+        {"text": "🎭 Любой", "callback": "gender_filter_any"},
+    ],
+    [
+        {"text": "⬅ Назад", "callback": "open_filters"}
+    ]
+)
+
+
+
+def keyboard_filters(profile):
+    min_age = profile.get("filters_age_min") or 18
+    max_age = profile.get("filters_age_max") or 35
+    gender = profile.get("filters_gender") or "Любой"
+    city = profile.get("filters_city") or "Любой"
+    
+
+
+    return InlineKeyboard(
+        [
+            {"text": f"Пол: {gender}", "callback": "gender_filters"},
+        ],
+        [
+            {"text": f"Возраст: {min_age}-{max_age}", "callback": "age_filters"},
+        ],
+        [
+            {"text": f"Город: {city}", "callback": "city_filters"},
+        ],
+        [
+            {"text": "Сбросить фильтры", "callback": "filters_reset"},
+        ],
+        [
+            {"text": "Готово", "callback": "back"},
+        ]
+    )
+
+def show_filters(ctx):
+    profile = get_profile(ctx.chat_id)
+    if not profile:
+        ctx.reply("Фильтры не найдены")
+        return
+
+    # берём значения из базы, только если None — дефолт
+    min_age = profile.get("filters_age_min")
+    max_age = profile.get("filters_age_max")
+    gender = profile.get("filters_gender")
+    city = profile.get("filters_city")
+
+    if min_age is None:
+        min_age = 18
+    if max_age is None:
+        max_age = 35
+    if gender is None:
+        gender = "Любой"
+    if city is None:
+        city = "Любой"
+
+    emoji = "👨" if gender == "М" else "👩" if gender == "Ж" else "🎭"
+
+    text = (
+        f"⚙️ Ваши фильтры:\n\n"
+        f"Пол: {gender} {emoji}\n"
+        f"Возраст: {min_age}–{max_age}\n"
+        f"Город: {city}"
+    )
+
+    ctx.reply(text, keyboard=keyboard_filters(profile))
+
+# Возраст
+def age_keyboard_filters(min_age, max_age):
+    return InlineKeyboard(
+        [
+            {"text": "⬅️ Мин -1", "callback": "age_min_minus"},
+            {"text": f"{min_age}", "callback": "noop"},
+            {"text": "Мин +1 ➡️", "callback": "age_min_plus"},
+        ],
+        [
+            {"text": "⬅️ Макс -1", "callback": "age_max_minus"},
+            {"text": f"{max_age}", "callback": "noop"},
+            {"text": "Макс +1 ➡️", "callback": "age_max_plus"},
+        ],
+        [
+            {"text": "✅ Готово", "callback": "done_filters"}
+        ]
+    )
+
+
+
+
+
+
+
+
+
+
+
+#=========================ПРИГЛАСИТЕЛЬНЫЙ ОБРАБОТКА=============
+
+def minutes_text(seconds):
+    return str(int(seconds//60)) + " мин" if seconds >= 60 else str(seconds) + " сек"
+
+# ====== Сообщение рефералки ======
+def invite_message(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # Всего приглашённых за всё время
+    cursor.execute("SELECT COUNT(*) FROM referrals WHERE inviter_id=?", (user_id,))
+    row = cursor.fetchone()
+    total_invited = row[0] if row else 0
+
+    # Текущее количество приглашений до следующего VIP
+    cursor.execute("SELECT invites FROM profiles WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    invites = row[0] if row else 0
+
+    total = 3
+    vip_awarded = False
+
+    # Выдача VIP при достижении 3 приглашений
+    if invites >= total:
+        vip_until = datetime.now() + timedelta(days=1)
+        cursor.execute("""
+            UPDATE profiles
+            SET vip_until = ?, invites = invites - ?
+            WHERE user_id = ?
+        """, (vip_until.strftime("%Y-%m-%d %H:%M:%S"), total, user_id))
+        conn.commit()
+        invites -= total
+        vip_awarded = True
+
+    conn.close()
+
+    # Прогресс-бар
+    filled = min(invites, total)
+    progress = "█" * filled + "░" * (total - filled)
+    remaining = max(0, total - invites)
+
+    def plural(n, one, few, many):
+        if n % 10 == 1 and n % 100 != 11:
+            return one
+        elif 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
+            return few
+        else:
+            return many
+
+    # Заголовок
+    if vip_awarded:
+        header = (
+            "🎉🔥 Ты пригласил 3 друзей!\n\n"
+            "💎 VIP активирован на 24 часа!\n\n"
+            f"👥 Всего приглашено: {total}\n"
+            "🚀 Продолжай приглашать и получай ещё VIP!"
+        )
+    else:
+        header = (
+            f"👥 Ты уже пригласил: {total_invited} {plural(total_invited,'друга','друга','друзей')}\n\n"
+            f"🧑‍🤝‍🧑 Прогресс: {invites} / {total} {progress}\n"
+            f"🔥 Осталось {remaining} {plural(remaining,'друг','друга','друзей')} до VIP!"
+        )
+
+    invite_link = f"https://max.ru/{BOT_USERNAME}?start={user_id}"
+
+    text = (
+        f"🎁 Получай VIP бесплатно!\n\n"
+        f"{header}\n\n"
+        f"📩 Твоя персональная ссылка:\n{invite_link}\n\n"
+        "Отправь её друзьям и получай бонусы 💬🔥\n\n"
+        f"💎 За каждых {total} друзей — 1 день VIP"
+    )
+
+    keyboard = InlineKeyboard([
+        {"text": "🏠 Главное меню", "callback": "main_menu"}
+    ])
+
+    return text, keyboard
+
+
+
+#=====================================================================================
+
+def create_profile(user_id, invited_by=None):
+    """Создаёт новый профиль пользователя в базе, если его нет"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO profiles (
+            user_id, name, gender, birthdate, age, zodiac,
+            city, region, about, photo_url, is_vip,
+            invites, vip_until, invited_by
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id, "", "", "", 0, "",
+        "", "", "", "", 0,
+        0, None, invited_by
+    ))
+
+    conn.commit()
+    conn.close()
+
+def create_profile_if_not_exists(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    # проверяем, есть ли профиль
+    cur.execute("SELECT 1 FROM profiles WHERE user_id = ?", (user_id,))
+    if not cur.fetchone():
+        # если нет — создаём
+        cur.execute("""
+            INSERT INTO profiles (user_id, invites, vip_until)
+            VALUES (?, 0, NULL)
+        """, (user_id,))
+        print(f"PROFILE CREATED: {user_id}")
+        conn.commit()
+    else:
+        print(f"PROFILE EXISTS: {user_id}")
+
+    conn.close()
+
+def process_referral(inviter_id, invited_id):
+    """
+    Обрабатывает приглашение нового пользователя
+    """
+
+    if inviter_id == invited_id:
+        return  # нельзя пригласить самого себя
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    try:
+        # Проверяем, не был ли уже добавлен этот invited_id
+        cursor.execute(
+            "SELECT 1 FROM referrals WHERE invited_id=?",
+            (invited_id,)
+        )
+        if cursor.fetchone():
+            return  # уже учитывался
+
+        # Добавляем запись
+        cursor.execute(
+            "INSERT INTO referrals (inviter_id, invited_id) VALUES (?, ?)",
+            (inviter_id, invited_id)
+        )
+
+        # Увеличиваем invites
+        cursor.execute(
+            "UPDATE profiles SET invites = invites + 1 WHERE user_id=?",
+            (inviter_id,)
+        )
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
+def register_new_user(new_user_id, inviter_id=None):
+    """
+    Создаёт профиль нового пользователя и, если есть пригласивший, добавляет запись в referrals
+    и увеличивает счётчик invites.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        # Создаём профиль, если ещё нет
+        cursor.execute(
+            "INSERT OR IGNORE INTO profiles (user_id, invites) VALUES (?, 0)",
+            (new_user_id,)
+        )
+        conn.commit()
+
+        if inviter_id and inviter_id != new_user_id:
+            # Добавляем запись в referrals (уникально)
+            cursor.execute(
+                "INSERT OR IGNORE INTO referrals (inviter_id, invited_id) VALUES (?, ?)",
+                (inviter_id, new_user_id)
+            )
+            conn.commit()
+
+            # Увеличиваем invites и проверяем на VIP
+            add_invite(inviter_id)
+    finally:
+        conn.close()
+
+
+def add_invite(user_id):
+    """
+    Увеличивает счётчик приглашений и выдаёт VIP на 1 день за каждые 3 приглашения.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    try:
+        # Увеличиваем счётчик
+        cursor.execute("UPDATE profiles SET invites = invites + 1 WHERE user_id=?", (user_id,))
+        conn.commit()
+
+        # Получаем новое значение
+        cursor.execute("SELECT invites FROM profiles WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+        invites = row[0] if row else 0
+
+        if invites >= 3:
+            # Выдаём VIP на 1 день
+            vip_until = datetime.now() + timedelta(days=1)
+            cursor.execute("""
+                UPDATE profiles
+                SET vip_until = ?, invites = invites - 3
+                WHERE user_id=?
+            """, (vip_until.strftime("%Y-%m-%d %H:%M:%S"), user_id))
+            conn.commit()
+    finally:
+        conn.close()
+        
+# ================== УНИВЕРСАЛЬНАЯ ОБРАБОТКА ПОЛ ==================
+    # ------------------ ОБРАБОТЧИК ВЫБОРА ПОЛА ------------------
+def process_gender_selection(ctx, chat_id, payload):
+    u = users[chat_id]
+
+    if u.get("step") != "gender_select":
+        return True
+
+    # Сохраняем выбранный пол
+    u["gender"] = "М" if payload == "gender_m" else "Ж"
+
+    if u.get("mode") == "edit":
+        save_profile(chat_id, u)
+        u["step"] = None
+        u["is_editing"] = False
+
+        # Показываем клавиатуру редактирования с правильным "Готово"
+        ctx.reply(
+            "Пол обновлён ✅",
+            keyboard=get_edit_keyboard(is_saved=u.get("editing_existing", False))
+        )
+        return True
+
+    # если создание анкеты
+    u["step"] = "birth_day"
+    ctx.reply("Введите день рождения (1-31):")
+    return True
+        
+# ================== УНИВЕРСАЛЬНАЯ ОБРАБОТКА ДАТЫ РОЖДЕНИЯ ==================
+def handle_birthdate(ctx, u, chat_id, step, text, creation=True):
+    """
+    Универсальный блок для ввода даты рождения.
+    - step: birth_day / birth_month / birth_year или edit_birth_day / edit_birth_month / edit_birth_year
+    - creation=True -> создание анкеты (лимит 18+)
+    - creation=False -> редактирование анкеты (лимит 14–100)
+    """
+
+    if step in ("birth_day", "edit_birth_day"):
+        if not text.isdigit() or not 1 <= int(text) <= 31:
+            ctx.reply("Введите число от 1 до 31")
+            return
+        u["birth_day"] = int(text)
+        u["step"] = "birth_month" if step == "birth_day" else "edit_birth_month"
+        ctx.reply("Введите месяц рождения (1-12):")
+        return
+
+    if step in ("birth_month", "edit_birth_month"):
+        if not text.isdigit() or not 1 <= int(text) <= 12:
+            ctx.reply("Введите число от 1 до 12")
+            return
+        u["birth_month"] = int(text)
+        u["step"] = "birth_year" if step == "birth_month" else "edit_birth_year"
+        ctx.reply("Введите год рождения:")
+        return
+
+    if step in ("birth_year", "edit_birth_year"):
+        if not text.isdigit():
+            ctx.reply("Введите год числом")
+            return
+
+        year = int(text)
+        try:
+            birthdate = datetime(year, u["birth_month"], u["birth_day"])
+        except ValueError:
+            ctx.reply("Некорректная дата")
+            u["step"] = "birth_day" if step == "birth_year" else "edit_birth_day"
+            return
+
+        # Вычисляем возраст
+        today = datetime.now()
+        age = today.year - year - ((today.month, today.day) < (u["birth_month"], u["birth_day"]))
+
+        # Проверка возраста
+        if creation and age < 18:
+            ctx.reply("Вам должно быть 18+ 🚫")
+            u["step"] = None
+            return
+
+        if not creation and (age < 14 or age > 100):
+            ctx.reply("Некорректная дата рождения")
+            u["step"] = "edit_birth_day"
+            return
+
+        u["birthdate"] = birthdate.strftime("%d.%m.%Y")
+        u["age"] = age
+        u["zodiac"] = get_zodiac(u["birth_day"], u["birth_month"])
+
+    # -------- РАЗДЕЛЯЕМ СОЗДАНИЕ И РЕДАКТИРОВАНИЕ --------
+
+    if creation:
+        u["step"] = "city_search"
+        u["city_mode"] = "profile_create"
+
+        save_profile(chat_id, {
+            "birthdate": u["birthdate"],
+            "age": u["age"],
+            "zodiac": u["zodiac"]
+        })
+
+        ctx.reply("Введите первые буквы города:")
+        return
+
+    else:
+        u["step"] = "edit"
+
+        save_profile(chat_id, {
+            "birthdate": u["birthdate"],
+            "age": u["age"],
+            "zodiac": u["zodiac"]
+        })
+
+        keyboard = get_edit_keyboard(is_saved=u.get("editing_existing", False))
+        ctx.reply("Дата рождения сохранена ✅", keyboard=keyboard)
+        return
 # ================== УНИВЕРСАЛЬНЫЙ ВЫБОР ГОРОДА ==================
 def send_city_selection(ctx, text, limit=5):
     """
@@ -824,44 +1391,397 @@ def find_cities(prefix, limit=10):
     except:
         return []
 
-# ================== ОБРАБОТКА ПРОФИЛЯ ==================
-def show_profile(ctx, profile, keyboard):
-    emoji = "👨" if profile.get("gender") == "М" else "👩"
+# ================== ПОКАЗ ПРОФИЛЯ ==================
+def show_profile(ctx, profile, keyboard, zodiac_name=None, zodiac_sign=None):
+    """
+    Отображает анкету пользователя или партнёра с эмодзи пола и знаком зодиака.
+    """
+    if zodiac_name and zodiac_sign:
+        zodiac_text = f"{zodiac_sign} {zodiac_name}"
+    else:
+        zodiac_text = profile.get("zodiac", "")
+    # Эмодзи по полу
+    emoji = "👤"
+    if profile.get("gender") == "М":
+        emoji = "👨"
+    elif profile.get("gender") == "Ж":
+        emoji = "👩"
+
+    # Знак зодиака с эмодзи
+    zodiac_name = profile.get("zodiac")
+    zodiac_emoji = ZODIAC_SIGNS.get(zodiac_name, "") if zodiac_name else ""
+    zodiac_display = f"{zodiac_emoji} {zodiac_name}" if zodiac_name else "Не указан"
+
+    # VIP статус
+    vip_status = "Да" if profile.get("is_vip") else "Нет"
+
     text = (
-        f"{emoji} Ваша анкета:\n\n"
+        f"{emoji} Анкета:\n\n"
         f"Имя: {profile.get('name')}\n"
         f"Пол: {profile.get('gender')}\n"
         f"🎂 Дата рождения: {profile.get('birthdate')}\n"
         f"🎈 Возраст: {profile.get('age')}\n"
+        f"🪐 Знак зодиака: {zodiac_display}\n"
         f"🏙 Город: {profile.get('city')}\n"
         f"✍️ О себе: {profile.get('about')}\n"
-        f"💎 VIP: {'да' if profile.get('is_vip') else 'нет'}\n"
+        f"💎 VIP: {vip_status}\n"
         f"📸 Фото:\n{profile.get('photo_url')}"
     )
-    
+
     ctx.reply(text, keyboard=keyboard)
+        
+# ================== УНИВЕРСАЛЬНАЯ АКТИВАЦИЯ VIP ==================
+def activate_vip_for_profile(profile, days):
+    now = datetime.now()
+    vip_until_str = profile.get("vip_until")
+    if vip_until_str:
+        try:
+            vip_until = datetime.strptime(vip_until_str, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            vip_until = now
+        new_vip_until = vip_until + timedelta(days=days) if vip_until > now else now + timedelta(days=days)
+    else:
+        new_vip_until = now + timedelta(days=days)
 
-def show_filters(ctx):
-      profile = get_profile(ctx.chat_id)
-      if not profile:
-          ctx.reply("Фильтры не найдены")
-          return
+    profile["vip_until"] = new_vip_until.strftime("%Y-%m-%d %H:%M:%S")
+    profile["is_vip"] = True
+    save_profile(profile)
+    return new_vip_until
 
-      gender = profile.get("filters_gender") or "Любой"
-      min_age = profile.get("filters_age_min") or MIN_AGE_LIMIT
-      max_age = profile.get("filters_age_max") or MAX_AGE_LIMIT
-      city = profile.get("filters_city") or "Любой"
+# ================== ОБРАБОТКА VIP КОМАНД АДМИНА ==================
+def handle_vip_commands(ctx, text):
+    chat_id = str(ctx.chat_id)
+    if not text or chat_id != ADMIN_ID:
+        return
 
-      emoji = "👨" if gender == "М" else "👩" if gender == "Ж" else "🎭"
+    parts = text.strip().split()
+    cmd = parts[0].lower()
+    if cmd not in ("/givevip", "/removevip"):
+        return
 
-      text = (
-          f"⚙️ Ваши фильтры:\n\n"
-          f"Пол: {gender} {emoji}\n"
-          f"Возраст: {min_age}–{max_age}\n"
-          f"Город: {city}"
-      )
+    try:
+        user_id = int(parts[1])
+    except (IndexError, ValueError):
+        ctx.reply(f"Использование: {cmd} user_id [дни]" if cmd == "/givevip" else f"Использование: {cmd} user_id")
+        return
 
-      ctx.reply(text, keyboard=keyboard_filters(profile))
+    profile = get_profile(user_id)
+    if not profile:
+        ctx.reply(f"Профиль пользователя {user_id} не найден ❌")
+        return
+
+    if cmd == "/givevip":
+        try:
+            days = int(parts[2])
+        except (IndexError, ValueError):
+            ctx.reply("Использование: /givevip user_id дни")
+            return
+        new_vip_until = activate_vip_for_profile(profile, days)
+        ctx.reply(f"VIP выдан пользователю {user_id} до {new_vip_until.strftime('%d.%m.%Y')} ✅")
+    else:
+        profile["vip_until"] = None
+        profile["is_vip"] = False
+        save_profile(profile)
+        ctx.reply(f"VIP удалён у пользователя {user_id} ✅")
+        
+# ================== ЗОДИАК ==================
+def get_zodiac(day, month):
+    zodiac_dates = [
+        (120, "Козерог"), (218, "Водолей"), (320, "Рыбы"), (420, "Овен"),
+        (521, "Телец"), (621, "Близнецы"), (722, "Рак"), (823, "Лев"),
+        (923, "Дева"), (1023, "Весы"), (1122, "Скорпион"), (1222, "Стрелец"), (1231, "Козерог")
+    ]
+    n = month * 100 + day
+    for end, sign in zodiac_dates:
+        if n <= end:
+            return sign
+    return "Козерог"
+
+
+# ================== СОЗДАНИЕ АНКЕТЫ ===================
+def process_profile_creation(ctx, u, text, attachments):
+    chat_id = str(ctx.chat_id)
+    step = u.get("step")
+
+    # ------------------ Защита редактирования ------------------
+    if u.get("is_editing"):
+        return
+
+    # ---------- Имя ----------
+    if step == "name":
+        if not text:
+            ctx.reply("Введите имя")
+            return
+
+        u["name"] = text
+
+        # ⚠ ВАЖНО — теперь шаг не gender, а gender_select
+        u["step"] = "gender_select"
+
+        ctx.reply("Выберите пол:", keyboard=gender_keyboard)
+        return
+
+    # ---------- День/Месяц/Год рождения ----------
+    if step in ("birth_day", "birth_month", "birth_year"):
+        handle_birthdate(ctx, u, chat_id, step, text, creation=True)
+        return
+
+    # ---------- Город ----------
+    if step == "city_search":
+        send_city_selection(ctx, text)
+        return
+
+    # ---------- О себе ----------
+    if step == "about":
+        if not text:
+            ctx.reply("Напишите о себе")
+            return
+        u["about"] = text
+        u["step"] = "photo"
+        ctx.reply("Пришлите фото (картинка или ссылка):")
+        return
+
+    # ---------- Фото ----------
+    if step == "photo":
+        photo_url = None
+        for att in attachments:
+            if att.get("type") == "image":
+                photo_url = att.get("payload", {}).get("url")
+                break
+
+        if not photo_url and text.startswith("http"):
+            photo_url = text
+
+        if not photo_url:
+            ctx.reply("Фото не найдено, пришлите изображение")
+            return
+
+        u["photo_url"] = photo_url
+        u["step"] = None
+        save_profile(chat_id, u)
+
+    # ---------- Отображение анкеты ----------
+    zodiac_name = u.get("zodiac_name") or u.get("zodiac") or "Не указан"
+    zodiac_sign = u.get("zodiac_sign") or ZODIAC_SIGNS.get(zodiac_name, "")
+
+    show_profile(ctx, u, save_menu, zodiac_name=zodiac_name, zodiac_sign=zodiac_sign)
+    
+    
+        
+# ================== УНИВЕРСАЛЬНОЕ РЕДАКТИРОВАНИЕ ==================
+# ================== УНИВЕРСАЛЬНОЕ РЕДАКТИРОВАНИЕ ==================
+def handle_profile_edit(ctx, u, step, text, attachments):
+    """
+    Универсальный обработчик редактирования анкеты через клавиатуру.
+    - step: текущий шаг редактирования
+    - editing_existing = True -> редактируем существующую анкету
+    """
+    chat_id = str(ctx.chat_id)
+    is_saved = u.get("editing_existing", False)
+
+    # ------------------ Имя ------------------
+    if step == "edit_name":
+        if not text:
+            print("[DEBUG] Имя не введено, запрашиваем снова")
+            ctx.reply("Введите имя:")
+            return True
+
+        u["name"] = text.strip()
+        if u.get("editing_existing", False):
+            save_profile(chat_id, u)
+        ctx.reply(
+            "Имя обновлено ✅",
+            keyboard=get_edit_keyboard(is_saved=u.get("editing_existing", False))
+        )
+        u["step"] = None
+        u["is_editing"] = False  # Сбрасываем режим редактирования
+        return True
+
+    # ------------------ Пол ------------------
+    # ------------------ ОБРАБОТЧИК ВЫБОРА ПОЛА ------------------
+    if step == "gender_select":
+        if text not in ("М", "Ж"):
+            ctx.reply("Выберите пол кнопкой 👆")
+            return True
+
+        chat_id = str(ctx.chat_id)
+        u["gender"] = text
+
+        # Если редактирование — сохраняем и возвращаем на предыдущую клавиатуру
+        if u.get("mode") == "edit":
+            save_profile(chat_id, u)
+            u["step"] = None
+            u["is_editing"] = False
+
+            # Определяем, какая клавиатура была до выбора пола
+            print = u.get("return_keyboard")
+            prev_payload = u.get("return_keyboard")
+            if prev_payload in ("edit_gender_save", "edit_gender_profile"):
+                # Показываем profile_menu или save_menu в зависимости от payload
+                keyboard = save_menu if prev_payload == "edit_gender_save" else profile_menu
+            else:
+                # По умолчанию — клавиатура редактирования
+                keyboard=get_edit_keyboard(is_saved=u.get("editing_existing", False))
+
+            ctx.reply("Пол обновлён ✅", keyboard=keyboard)
+        return True
+
+
+
+
+    # ------------------ Обработка даты рождения в handle_profile_edit ------------------
+    if step in ("edit_birth_day", "edit_birth_month", "edit_birth_year"):
+        print(f"[DEBUG] Шаг редактирования даты рождения: {step}")
+        print(f"[DEBUG] Ввод пользователя: {text}")
+
+        handle_birthdate(ctx, u, chat_id, step, text, creation=not u.get("editing_existing", False))
+
+        # Проверяем, завершено ли редактирование
+        if step == "edit_birth_year" and u.get("birthdate"):
+            print(f"[DEBUG] Дата рождения обновлена: {u['birthdate']}")
+            ctx.reply(
+                "Дата рождения обновлена ✅",
+                keyboard=get_edit_keyboard(is_saved=u.get("editing_existing", False))
+            )
+            u["step"] = None
+
+        return True
+
+    # ------------------ Город ------------------
+    # ------------------ ТЕКСТОВЫЙ ВВОД ГОРОДА ------------------
+    if step in ("city_search", "edit_city_search_"):
+        if not text or len(text.strip()) < 2:
+            ctx.reply("Введите минимум 2 буквы города")
+            return True
+
+        # просто вызываем функцию поиска и формирования клавиатуры
+        send_city_selection(ctx, text)
+        return True
+
+    # ------------------ НАЖАТИЕ КНОПКИ ГОРОДА ------------------
+    elif ctx.payload and ctx.payload.startswith("city_selected:"):
+        chat_id = str(ctx.chat_id)
+        users.setdefault(chat_id, {"step": None})
+        u = users[chat_id]
+
+        data = ctx.payload.replace("city_selected:", "")
+        city, region = data.split("|")
+        city = city.replace("_", " ")
+        region = region.replace("_", " ") if region != "—" else ""
+
+        u["city"] = city
+        u["region"] = region
+
+        # Сохраняем в базе
+        save_profile(chat_id, u)
+
+        # Показываем клавиатуру редактирования
+        ctx.reply(
+            f"Город обновлён: {city} ✅",
+            keyboard=get_edit_keyboard(is_saved=u.get("editing_existing", False))
+        )
+
+        u["step"] = None
+        return True
+
+
+
+
+
+
+
+
+    # ------------------ О себе ------------------
+    if step == "edit_about":
+        print(f"[DEBUG] Шаг редактирования 'О себе': {step}")
+        print(f"[DEBUG] Ввод пользователя: {text}")
+
+        if not text:
+            print("[DEBUG] Текст не введён, запрашиваем снова")
+            ctx.reply("Напишите немного о себе:")
+            return True
+
+        u["about"] = text.strip()
+        print(f"[DEBUG] Поле 'О себе' обновлено во временном профиле: {u['about']}")
+
+        if u.get("editing_existing", False):
+            save_profile(chat_id, u)
+            print(f"[DEBUG] Поле 'О себе' сохранено в базе для chat_id={chat_id}")
+
+        ctx.reply(
+            "О себе обновлено ✅",
+            keyboard=get_edit_keyboard(is_saved=u.get("editing_existing", False))
+        )
+
+        u["step"] = None
+        return True
+
+    # ------------------ Ввод фото ------------------
+    if step == "edit_photo":
+        print(f"[DEBUG] Шаг редактирования фото: {step}")
+        print(f"[DEBUG] Вложения пользователя: {attachments}")
+
+        if not attachments:
+            print("[DEBUG] Фото не отправлено, запрашиваем снова")
+            ctx.reply("Отправьте фото:")
+            return True
+
+        # Сохраняем первую присланную фотку
+        photo_url = attachments[0].get("payload", {}).get("url")
+        if not photo_url:
+            print("[DEBUG] Ссылка на фото отсутствует, запрашиваем снова")
+            ctx.reply("Отправьте корректное фото:")
+            return True
+
+        u["photo_url"] = photo_url
+        print(f"[DEBUG] Фото обновлено во временном профиле: {photo_url}")
+
+        if u.get("editing_existing", False):
+            save_profile(chat_id, u)
+            print(f"[DEBUG] Фото сохранено в базе для chat_id={chat_id}")
+
+        # Показываем клавиатуру редактирования для следующего шага анкеты
+        ctx.reply(
+            "Фото обновлено ✅",
+            keyboard=get_edit_keyboard(is_saved=u.get("editing_existing", False))
+        )
+        print("[DEBUG] Клавиатура редактирования показана")
+
+        u["step"] = None
+        return True
+
+    # ------------------ Кнопка Готово ------------------
+    if step in ("edit_save_profile", "edit_done_create"):
+        u["step"] = None
+
+        if is_saved:
+            profile = load_profile(chat_id)
+            show_profile(ctx, profile, save_menu)
+            ctx.reply(
+                "Редактирование завершено ✅",
+                keyboard=get_edit_keyboard(is_saved=True)
+            )
+        else:
+            save_profile(chat_id, u)
+            show_profile(ctx, u, save_menu)
+            ctx.reply(
+                "Анкета создана ✅",
+                keyboard=get_edit_keyboard(is_saved=True)
+            )
+        return True
+
+    return False
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -882,366 +1802,115 @@ def vip_active(profile):
         vip_time = datetime.strptime(vip_until, "%Y-%m-%d %H:%M:%S")
         return datetime.now() < vip_time
     except Exception as e:
-        print(f"[VIP CHECK ERROR] {e}")
-        return False
-
-
-# Функция для автоматического отключения чата
-def auto_leave_if_non_vip(user_id, partner_id):
-    # === СТАТИСТИКА: запуск поиска ===
-    increment_stat(user_id, "roulette_joins")
-    time.sleep(180)  # Ждём 3 минуты (180 секунд)
-    profile = get_profile(user_id)
-    partner_profile = get_profile(partner_id)
-
-    # Проверка на None
-    if profile is None or partner_profile is None:
-        return
-
-    if not is_vip(profile) and not is_vip(partner_profile):
-        if user_id in active_chats and active_chats[user_id] == partner_id:
-            del active_chats[user_id]
-            del active_chats[partner_id]
-            ctx = contexts.get(user_id)
-            p_ctx = contexts.get(partner_id)
-            if ctx:
-                ctx.reply("Время истекло. Оба участника не имеют VIP-статус, поэтому чат автоматически закрыт.")
-            if p_ctx:
-                p_ctx.reply("Время истекло. Оба участника не имеют VIP-статус, поэтому чат автоматически закрыт.")
-
- 
-
-def is_vip(profile):
-    """
-    Проверяет активность VIP-подписки у пользователя.
-    """
-    vip_until = profile.get("vip_until")
-    if not vip_until:
-        return False
-    try:
-        vip_time = datetime.strptime(vip_until, "%Y-%m-%d %H:%M:%S")
-        return datetime.now() < vip_time
-    except ValueError:
-        return False
-
-
-def chat_timer(u1, u2):
-    timer_seconds = get_chat_timer()
-    time.sleep(timer_seconds)
-
-    if active_chats.get(u1) != u2:
-        return
-
-    p1 = get_profile(u1)
-    p2 = get_profile(u2)
-
-    if is_vip(p1) or is_vip(p2):
-        return
-
-    active_chats.pop(u1, None)
-    active_chats.pop(u2, None)
-
-    msg = (
-        "⏳ Время вышло. Ваш диалог автоматически завершен."
-        "\n💎 Хотите продолжать разговоры без временных ограничений?"
-        "Оформите VIP-подписку!"
-    )
-
-    if u1 in contexts:
-        contexts[u1].reply(msg, keyboard=vip_menu())
-    if u2 in contexts:
-        contexts[u2].reply(msg, keyboard=vip_menu())
-
-
-def intellectmoney_link(order_id: str, amount: float, client_email: str) -> str:
-    """
-    Генерация ссылки для выставления счета через IntellectMoney.
         
-    :param order_id: Внутренний номер заказа
-    :param amount: Сумма в рублях (1 – 3 500 000)
-    :param client_email: Email пользователя
-    :return: Ссылка на оплату
-    """
-    # Проверка диапазона суммы
-    if amount < 1 or amount > 3500000:
-        raise ValueError("Сумма оплаты должна быть от 1 до 3 500 000 ₽")
+        return False
 
-    base_url = "https://merchant.intellectmoney.ru/"
-    params = {
-        "eshopId": IM_ESHOP_ID,       # обязательно
-        "orderId": order_id,          # внутренний номер заказа
-        "recipientAmount": f"{amount:.2f}",  # обязательно!
-        "recipientCurrency": "RUB",   # валюта
-        "ClientEmail": client_email,
-        "TestMode": IM_TEST           # 1 — тест, 0 — реальный платеж
-    }
+# ==================== Фильтры ====================
+def get_filters(user_id):
+    """Возвращает фильтры пользователя из базы (город, пол)."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT filters_city, filters_gender
+        FROM profiles
+        WHERE user_id=?
+    """, (user_id,))
+    row = cursor.fetchone()
+    conn.close()
 
-    query_string = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
-    return f"{base_url}?{query_string}"
+    if not row:
+        return {}
+
+    city, gender = row
+    filters = {}
+    if city:
+        filters["city"] = city
+    if gender:
+        filters["gender"] = gender
+    return filters
+
+# ==================== VIP Проверка ====================
+def is_vip(profile):
+    return profile.get("is_vip", False)
 
 
 
-# ================== ОБРАБОТЧИК ==================
+
+# ================== ОБРАБОТКА ВВОДА ГОРОДА ==================
 @bot.on("message_created")
-#Установка таймера в админке
-def handle_timer_input(ctx):
-    state = user_states.get(str(ctx.chat_id))
-    if state != "waiting_timer":
-        return  # пользователь не в режиме ввода таймера
-
-    # безопасно получаем текст
-    text = ctx.message.get("body", {}).get("text")
-    if not text or not text.isdigit():
-        ctx.reply("⛔ Пожалуйста, введите число секунд (10-3600).")
-        return
-
-    seconds = int(text)
-    if seconds < 10 or seconds > 3600:
-        ctx.reply("⛔ Таймер должен быть от 10 до 3600 секунд. Попробуйте ещё раз.")
-        return
-
-    # сохраняем в базу
-    set_chat_timer(seconds)
-    ctx.reply(f"✅ Таймер успешно обновлён: {seconds} секунд")
-
-    # сбрасываем состояние
-    user_states.pop(str(ctx.chat_id), None)
-
-
 def relay(ctx):
     user_id = str(ctx.chat_id)
     contexts[user_id] = ctx
-	# Сначала обрабатываем шаги анкеты
-    text_steps(ctx)
-    # ❗ Если это callback — выходим
+
+    print("\n========== NEW MESSAGE ==========")
+    print(f"[DEBUG] user_id: {user_id}")
+    print(f"[DEBUG] payload: {ctx.payload}")
+
+    text = ctx.message.get("text") or ctx.message.get("body", {}).get("text")
+    print(f"[DEBUG] raw text: {text}")
+
+    # 🔹 1. Сначала шаги анкеты
+    step_handled = text_steps(ctx)
+    print(f"[DEBUG] text_steps returned: {step_handled}")
+
+    if step_handled:
+        print("[DEBUG] Сообщение обработано шагами анкеты")
+        return
+
+    # 🔹 2. Если это callback — выходим
     if ctx.payload:
+        print("[DEBUG] Это callback, выходим")
         return
+
+    # 🔹 3. Если не в чате — выходим
     if user_id not in active_chats:
+        print("[DEBUG] Пользователь не в активном чате")
         return
+
     partner_id = active_chats[user_id]
-    text = ctx.message.get("body", {}).get("text")
+
     if not text:
+        print("[DEBUG] Текста нет")
         return
-    log.info(f"[Relay] {user_id} -> {partner_id}: {text}")
+
+    print(f"[Relay] {user_id} -> {partner_id}: {text}")
+
     if partner_id in contexts:
-        contexts[partner_id].reply(text)
-
-# ================== ЗОДИАК ==================
-def get_zodiac(day, month):
-    zodiac_dates = [
-        (120, "Козерог"), (218, "Водолей"), (320, "Рыбы"), (420, "Овен"),
-        (521, "Телец"), (621, "Близнецы"), (722, "Рак"), (823, "Лев"),
-        (923, "Дева"), (1023, "Весы"), (1122, "Скорпион"), (1222, "Стрелец"), (1231, "Козерог")
-    ]
-    n = month * 100 + day
-    for end, sign in zodiac_dates:
-        if n <= end:
-            return sign
-    return "Козерог"
-
-# Логика шагов анкеты
+        contexts[partner_id].reply(text)       
+        
 def text_steps(ctx):
     chat_id = str(ctx.chat_id)
     users.setdefault(chat_id, {"step": None})
     u = users[chat_id]
     step = u.get("step")
+
+    print(f"[DEBUG text_steps] step: {step}")
+
     if not step:
-        return
+        print("[DEBUG text_steps] step отсутствует")
+        return False
 
     text = ctx.message.get("text") or ctx.message.get("body", {}).get("text", "")
     attachments = ctx.message.get("body", {}).get("attachments", [])
 
+    print(f"[DEBUG text_steps] text: {text}")
+    print(f"[DEBUG text_steps] is_editing: {u.get('is_editing')}")
 
-    # -------- Имя --------
-    if step == "name":
-        if not text:
-            ctx.reply("Введите имя текстом")
-            return
-        u["name"] = text
-        if u.get("step_edit"):
-            u["step"] = "edit"
-            ctx.reply("Имя обновлено ✅", keyboard=edit_keyboard)
-        else:
-            u["step"] = "gender"
-            ctx.reply("Выберите пол:", keyboard=gender_keyboard)
-        return
+    # ------------------ РЕДАКТИРОВАНИЕ ------------------
+    if u.get("is_editing"):
+        print("[DEBUG text_steps] Переходим в handle_profile_edit")
+        result = handle_profile_edit(ctx, u, step, text, attachments)
+        print(f"[DEBUG text_steps] handle_profile_edit вернул: {result}")
+        return result
 
-    # -------- День рождения --------
-    if step == "birth_day":
-        if not text.isdigit() or not 1 <= int(text) <= 31:
-            ctx.reply("Введите число от 1 до 31")
-            return
-        u["birth_day"] = int(text)
-        u["step"] = "birth_month"
-        ctx.reply("Введите месяц рождения (1–12):")
-        return
-    if step == "birth_month":
-        if not text.isdigit() or not 1 <= int(text) <= 12:
-            ctx.reply("Введите число от 1 до 12")
-            return
-        u["birth_month"] = int(text)
-        u["step"] = "birth_year"
-        ctx.reply("Введите год рождения:")
-        return
-    if step == "birth_year":
-        if not text.isdigit():
-            ctx.reply("Введите год числом")
-            return
-        year = int(text)
-        try:
-            birthdate = datetime(year, u["birth_month"], u["birth_day"])
-        except ValueError:
-            ctx.reply("Некорректная дата, попробуйте снова")
-            u["step"] = "birth_day"
-            return
+    # ------------------ СОЗДАНИЕ АНКЕТЫ ------------------
+    print("[DEBUG text_steps] Переходим в process_profile_creation")
+    process_profile_creation(ctx, u, text, attachments)
 
-        age = datetime.now().year - year - ((datetime.now().month, datetime.now().day) < (u["birth_month"], u["birth_day"]))
-        if age < 18:
-            ctx.reply("Доступ запрещён, возраст < 18 лет 🚫")
-            u["step"] = None
-            return
+    print("[DEBUG text_steps] Проверяем VIP команды")
+    handle_vip_commands(ctx, text)
 
-        u["birthdate"] = birthdate.strftime("%d.%m.%Y")
-        u["age"] = age
-        u["zodiac"] = get_zodiac(u["birth_day"], u["birth_month"])  # Используется функция get_zodiac
-
-        if u.get("step_edit"):
-            u["step"] = "edit"
-            ctx.reply("Дата рождения обновлена ✅", keyboard=edit_keyboard)
-        else:
-            u["step"] = "city_search"
-            u["city_mode"] = "profile_create"
-            ctx.reply("Введите первые буквы города:")
-        return
-
-        
-# -------- Город --------
-    if step == "city_search":
-        if len(text) < 2:
-            ctx.reply("Введите минимум 2 символа")
-            return
-
-        send_city_selection(ctx, text)
-        return
-
-    # -------- Обо мне --------
-    if step == "about":
-        if not text:
-            ctx.reply("Напишите текст о себе")
-            return
-        u["about"] = text
-        u["step"] = "photo"
-        ctx.reply("📸 Пришлите фото (вложение или ссылка):")
-        return
-
-    # -------- Фото --------
-    if step == "photo":
-        photo_url = None
-        for att in attachments:
-            if att.get("type") == "image":
-                photo_url = att.get("payload", {}).get("url")
-                break
-        if not photo_url and text.startswith("http"):
-            photo_url = text
-        if not photo_url:
-            ctx.reply("❌ Фото не найдено. Пришлите изображение или ссылку.")
-            return
-
-        u["photo_url"] = photo_url
-        u["step"] = None  # анкета заполнена
-
-        save_profile(chat_id, u)
-        profile = get_profile(chat_id)
-
-        emoji = "👨" if u.get("gender") == "М" else "👩"
-        result = (
-            f"{emoji} Ваша анкета:\n\n"
-            f"Имя: {u.get('name')}\n"
-            f"Пол: {u.get('gender')}\n"
-            f"🎂 Дата рождения: {u.get('birthdate')}\n"
-            f"🎈 Возраст: {u.get('age')}\n"
-            f"🔮 Знак зодиака: {u.get('zodiac')}\n"
-            f"🏙 Город: {u.get('city')}\n"
-            f"✍️ О себе: {u.get('about')}\n\n"
-            f"📸 Фото:\n{u.get('photo_url')}"
-        )
-        ctx.reply(result, keyboard=save_menu)
-        return       
-        
-
-###############################################################################
-
-    if ctx.payload == "vip_menu":
-
-        profile = get_profile(chat_id)
-
-        if vip_active(profile):
-            text = (
-                "💎 *VIP активен*\n\n"
-                f"Действует до: {profile.vip_until.strftime('%d.%m.%Y %H:%M')}"
-            )
-        else:
-            text = (
-                "💎 *VIP подписка*\n\n"
-                "Преимущества:\n"
-                "✔ Безлимитные чаты\n"
-                "✔ Нет авто-закрытия\n"
-                "✔ Приоритет в поиске\n\n"
-                "Выберите тариф 👇"
-            )
-
-        keyboard = InlineKeyboard(
-            [{"text": "💎 30 дней — 300 ₽", "callback": "vip_30"}],
-            [{"text": "💎 90 дней — 800 ₽", "callback": "vip_90"}],
-            [{"text": "⬅ Назад", "callback": "back"}]
-        )
-
-        ctx.reply(text, keyboard=keyboard, parse_mode="Markdown")
-
-    if ctx.text.startswith("/givevip") and chat_id == ADMIN_ID:
-        try:
-            user_id = int(ctx.text.split()[1])
-            days = int(ctx.text.split()[2])
-            activate_vip(user_id, days)
-            ctx.reply(f"VIP выдан пользователю {user_id} на {days} дней")
-        except:
-            ctx.reply("Использование: /givevip user_id дни")
-
-
-    if ctx.text.startswith("/removevip") and chat_id == ADMIN_ID:
-        try:
-            user_id = int(ctx.text.split()[1])
-            remove_vip(user_id)
-            ctx.reply(f"VIP удалён у пользователя {user_id}")
-        except:
-            ctx.reply("Использование: /removevip user_id")
-
-# Настраиваем тарифы
-tariffs = {
-    "vip_30": {"days": 30, "price": 300, "name": "VIP 30 дней"},
-    "vip_90": {"days": 90, "price": 800, "name": "VIP 90 дней"},
-    "vip_365": {"days": 365, "price": 3000, "name": "VIP 365 дней"},
-}
-
-# Универсальная функция активации VIP
-def activate_vip_for_profile(profile, days):
-    now = datetime.now()
-    
-    if profile.get("vip_until"):
-        try:
-            vip_until = datetime.strptime(profile["vip_until"], "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            vip_until = now
-        if vip_until > now:
-            new_vip_until = vip_until + timedelta(days=days)
-        else:
-            new_vip_until = now + timedelta(days=days)
-    else:
-        new_vip_until = now + timedelta(days=days)
-    
-    profile["vip_until"] = new_vip_until.strftime("%Y-%m-%d %H:%M:%S")
-    save_profile(profile)
-    return new_vip_until
+    return True
 
 # Единый обработчик кнопок оплаты
 def handle_vip(ctx, chat_id):
@@ -1297,83 +1966,95 @@ def handle_payment_confirmation(chat_id, payload):
     return f"💎 VIP активирован на {tariff['days']} дней!\nДействует до: {new_vip_until.strftime('%d.%m.%Y %H:%M')}"
 
 
+@bot.on("message_created")
+
+#Установка таймера в админке
+def handle_timer_input(ctx):
+    state = user_states.get(str(ctx.chat_id))
+    if state != "waiting_timer":
+        return  # пользователь не в режиме ввода таймера
+
+    # безопасно получаем текст
+    text = ctx.message.get("body", {}).get("text")
+    if not text or not text.isdigit():
+        ctx.reply("⛔ Пожалуйста, введите число секунд (10-3600).")
+        return
+
+    seconds = int(text)
+    if seconds < 10 or seconds > 3600:
+        ctx.reply("⛔ Таймер должен быть от 10 до 3600 секунд. Попробуйте ещё раз.")
+        return
+
+    # сохраняем в базу
+    set_chat_timer(seconds)
+    ctx.reply(f"✅ Таймер успешно обновлён: {seconds} секунд")
+
+    # сбрасываем состояние
+    user_states.pop(str(ctx.chat_id), None)
+
+
+
+
+
+
+
 # ================== СТАРТ ==================
+
 @bot.on("bot_started")
 def start(ctx):
     chat_id = str(ctx.chat_id)
+    payload = ctx.payload  # inviter_id если пришёл по ссылке
+    print(f"BOT_STARTED: chat_id={chat_id}, payload={payload}")
+
     users.setdefault(chat_id, {"step": None})
 
+    # проверяем, есть ли профиль
     profile = get_profile(chat_id)
     if profile:
-        if profile.get("deleted_at"):
-            ctx.reply("⚠️ Ваша анкета помечена на удаление. Восстановить?", keyboard=restore_keyboard)
-        else:
-            ctx.reply("Главное меню:", keyboard=main_menu_kb(profile))
+        print(f"Профиль найден: {profile['user_id']}")
     else:
+        print("Профиля нет, создаём новый")
+
+        invited_by = None
+        if payload and payload != chat_id:
+            invited_by = payload
+            print(f"Пользователь пришёл по реферальной ссылке от {invited_by}")
+
+        # создаём профиль
+        create_profile(chat_id, invited_by=invited_by)
+
+        # записываем реферала
+        if invited_by:
+            process_referral(invited_by, chat_id)
+            print(f"Записали в referrals: {invited_by} -> {chat_id}")
+
+        # первый шаг анкеты
         ctx.reply("🔞 Вам есть 18 лет?", keyboard=age_keyboard)
+        return
 
-# ================== КНОПКА ОПЛАТЫ VIP ==================
-@bot.on("callback")
-def vip_pay(ctx):
-    chat_id = str(ctx.chat_id)
-    days = 30  # на сколько дней даём VIP
+    # профиль помечен на удаление
+    if profile.get("deleted_at"):
+        ctx.reply("⚠️ Ваша анкета помечена на удаление. Восстановить?", keyboard=restore_keyboard)
+        return
 
-    try:
-        payment = Payment.create({
-            "amount": {
-                "value": "149.00",  # сумма в рублях
-                "currency": "RUB"
-            },
-            "confirmation": {
-                "type": "redirect",
-                "return_url": f"https://t.me/YOUR_BOT_USERNAME?start=pay_{chat_id}_{days}"
-            },
-            "capture": True,
-            "description": f"VIP на {days} дней",
-            "metadata": {
-                "chat_id": chat_id,
-                "days": days
-            }
-        })
-
-        url = payment.confirmation.confirmation_url
-        ctx.reply(f"💎 Оплатите VIP по ссылке: [Перейти к оплате]({url})", parse_mode="Markdown")
-    except Exception as e:
-        ctx.reply(f"Ошибка создания платежа: {e}")
-
-def callback_handler(ctx):
-    chat_id = str(ctx.chat_id)
-    payload = ctx.payload
-
-    if payload == "vip_pay":
-        days = 30  # сколько дней VIP
-        try:
-            payment = Payment.create({
-                "amount": {"value": "149.00", "currency": "RUB"},
-                "confirmation": {
-                    "type": "redirect",
-                    "return_url": f"https://t.me/YOUR_BOT_USERNAME"
-                },
-                "capture": True,
-                "description": f"VIP на {days} дней",
-                "metadata": {"chat_id": chat_id, "days": days}
-            })
-            pending_payments[chat_id] = {"payment_id": payment.id, "days": days}
-            ctx.reply(f"💎 Оплатите VIP по ссылке: [Перейти к оплате]({payment.confirmation.confirmation_url})", parse_mode="Markdown")
-        except Exception as e:
-            ctx.reply(f"Ошибка создания платежа: {e}")
-
-    elif payload == "age_yes":
-        ctx.reply("✅ Отлично! Продолжаем…")
-    elif payload == "age_no":
-        ctx.reply("🚫 К сожалению, доступ запрещён.")
-    elif payload == "restore_profile":
-        ctx.reply("✅ Анкета восстановлена!")
+    # если профиль есть — главное меню
+    text, keyboard = main_menu(get_profile(chat_id), chat_id)
+    ctx.reply(text, keyboard=keyboard)
+    
+   
 
 
-#=============== Обработчик колбэков=========
+# Обработчик колбэков
+# Обработчик колбэков
+# Обработчик колбэков
+# Обработчик колбэков
+# Обработчик колбэков
 @bot.on("message_callback")
 def handle_callback(ctx):
+
+   
+    
+    
     chat_id = str(ctx.chat_id)
     data = ctx.payload
     payload = ctx.payload
@@ -1381,6 +2062,15 @@ def handle_callback(ctx):
     users.setdefault(chat_id, {"step": None})
     u = users[chat_id]
     profile = get_profile(chat_id)
+    
+    
+    
+    
+    
+    
+    
+    
+
  
     
     # ======= Обработка тарифов =======
@@ -1396,6 +2086,7 @@ def handle_callback(ctx):
             amount=tariff["price"],
             client_email="test@email.ru"
         )
+
 
             # Создаём платеж в YooKassa
             payment = Payment.create({
@@ -1441,44 +2132,84 @@ def handle_callback(ctx):
         return
 
 
-   # ======= Остальные колбэки =======
-    if ctx.payload == "open_profile":
-        # Показываем профиль пользователя
-        profile = get_profile(chat_id)
-        if not profile:
-            ctx.reply("Анкета не найдена")
-            return
-        show_profile(ctx, profile, profile_menu)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
     elif ctx.payload == "vip":
+        chat_id = str(ctx.chat_id)
         profile = get_profile(chat_id)
+        if not profile:
+            ctx.reply("❗ Профиль не найден.")
+            return
         if vip_active(profile):
             ctx.reply(
                 f"💎 VIP уже активен!\n\n"
                 f"📅 Действует до: {profile['vip_until']}\n\n"
                 f"Вы можете продлить подписку:",
-                keyboard=InlineKeyboard(
+                keyboard=InlineKeyboard([
                     [{"text": "🔁 Продлить VIP", "callback": "vip_tariv"}],
                     [{"text": "⬅ Назад", "callback": "back"}]
-                )
+                ])
             )
         else:
             ctx.reply(VIP_TEXT, keyboard=vip_start_keyboard)
             
     elif ctx.payload == "vip_tariv":
         ctx.reply("💎 Выберите тариф:", keyboard=vip_keyboard)
+
+
+
+
+
+
+
+
     elif ctx.payload == "vip_tarif":
         ctx.reply(
             "🔁 Выберите тариф для продления:",
             keyboard=vip_tarif_keyboard
         )
         return
+
+
+
     elif ctx.payload == "admin_panel":
         #Админ панель
         show_admin_panel(ctx)
+    elif ctx.payload == "admin_vip_on":
+        activate_vip(chat_id, 3650)
+        show_admin_panel(ctx)
+
+    elif ctx.payload == "admin_vip_off":
+        remove_vip(chat_id)
+        show_admin_panel(ctx)
+
     elif ctx.payload == "admin_refresh":
         show_admin_panel(ctx)
+
     elif ctx.payload == "admin_vip_on":
         activate_vip(chat_id, 3650)  # 10 лет фактически
         profile = get_profile(chat_id)
@@ -1487,41 +2218,345 @@ def handle_callback(ctx):
         remove_vip(chat_id)
         profile = get_profile(chat_id)
         ctx.reply("❌ VIP отключён", keyboard=admin_keyboard(profile))
+
+
+
+
+    elif ctx.payload == "delete":
+        # Пользователь хочет удалить профиль
+        ctx.reply("Вы уверены, что хотите удалить анкету?", keyboard=delete_save_menu)
+    elif ctx.payload == "edit":
+        # Пользователь хочет редактировать профиль
+        ctx.reply("Редактирование профиля:", keyboard=edit_keyboard)
+    elif ctx.payload == "save":
+        save_profile(chat_id, u)
+        text, keyboard = invite_message(chat_id)
+        ctx.reply(text, keyboard=keyboard)
+    elif ctx.payload == "invite":
+        text, keyboard = invite_message(chat_id)
+        ctx.reply(text, keyboard=keyboard)
+
+   
+    
+    elif ctx.payload == "delete_profile":
+        # Пользователь хочет удалить профиль
+        ctx.reply(
+            "Анкета будет удалена через 30 дней.\n\n"
+            "Вы уверены, что хотите удалить анкету?",
+            keyboard=delete_confirm_keyboard
+        )
+
+    elif ctx.payload == "done_edit":
+        # Сохраняем изменения и показываем меню редактирования
+        save_profile(chat_id, u)  # сохраняем текущие данные пользователя
+        ctx.reply("Изменения сохранены!", keyboard=edit_keyboard)  # показываем клавиатуру редактирования
+   
+    
+    elif ctx.payload == "menu_delete":
+        # Удаляем профиль полностью
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM profiles WHERE user_id=?", (chat_id,))
+        conn.commit()
+        conn.close()
+
+        # Удаляем данные из временной сессии
+        users.pop(chat_id, None)
+
+        # Сообщаем пользователю
+        ctx.reply(
+            "❌ Ваша анкета удалена полностью. Чтобы создать новую, перезапустите бота.",
+            keyboard=None
+        )    
+
+    elif ctx.payload == "confirm_delete":
+        # Помечаем профиль на удаление
+        soft_delete_profile(chat_id)
+
+        # Получаем профиль заново
+        profile = get_profile(chat_id)
+
+        # Отправляем сообщение о пометке на удаление с клавиатурой восстановления
+        ctx.reply(
+            "⚠️ Ваша анкета помечена на удаление. Восстановить?", 
+            keyboard=restore_keyboard
+        )
+
+    elif ctx.payload == "cancel_delete":
+        # Пользователь отказался от удаления профиля
+        text, keyboard = main_menu(get_profile(chat_id), chat_id)
+        ctx.reply(
+                f"Удаление отменено ✅\n\n{text}",
+                keyboard=keyboard
+        )
+
+
+
+    elif ctx.payload == "show_offer":
+        # Пользователь запрашивает оферту
+        ctx.reply(OFFER_TEXT, keyboard=vip_offer_keyboard)
+    elif ctx.payload == "offer_accept":
+        # Пользователь согласился с офертой
+        ctx.reply("💎 Выбирайте тариф для подписки", keyboard=vip_keyboard)
+    elif ctx.payload == "offer_decline":
+        # Пользователь отказался от оферты
+        profile = get_profile(chat_id)
+
+        text, keyboard = main_menu(profile, chat_id)
+
+        ctx.reply(
+                "❌ Вы не приняли условия оферты.\n\n"
+                "VIP-функции недоступны.\n\n"
+                f"{text}",
+                keyboard=keyboard
+        )
+
+    elif ctx.payload == "back":
+        # Пользователь вернулся назад
+        u["step"] = None
+        text, keyboard = main_menu(get_profile(chat_id), chat_id)
+        ctx.reply(text, keyboard=keyboard)
+    elif ctx.payload == "main_menu":
+        # Пользователь вернулся назад
+        u["step"] = None
+        text, keyboard = main_menu(get_profile(chat_id), chat_id)
+        ctx.reply(text, keyboard=keyboard)
+
+
+
+    # =========================
+    #         СОЗДАНИЕ
+    # =========================
+
+    # ------------------ Колбеки для новой анкеты ------------------
+    elif ctx.payload == "name":
+        # Редактируем имя
+        u["step"] = "name"
+        ctx.reply("Введите имя:")
+        
+    elif ctx.payload in ("gender_m", "gender_f"):
+        return process_gender_selection(ctx, chat_id, ctx.payload)
+
+    elif ctx.payload == "birthdate":
+        u["step"] = "birth_day"
+        ctx.reply("Введите день рождения (1-31):")
+
+    elif ctx.payload.startswith("city_selected:"):
+        chat_id = str(ctx.chat_id)
+        u = users.get(chat_id)
+        if not u:
+            print("[DEBUG] Пользователь не найден")
+            return True
+
+        is_saved = u.get("editing_existing", False)
+
+        data = ctx.payload.replace("city_selected:", "")
+        city, region = data.split("|")
+        city_name = city.replace("_", " ")
+        region_name = region.replace("_", "—") if region != "—" else ""
+
+        u["city"] = city_name
+        u["region"] = region_name
+
+        # если это выбор города для фильтров
+        if u.get("city_mode") == "filters":
+            update_filter(chat_id, "filters_city",
+                          f"{city_name} ({region_name})" if region_name else city_name)
+            u["step"] = None
+            u["city_mode"] = None
+            show_filters(ctx)
+            return True
+
+        # редактирование существующей анкеты
+        if is_saved:
+            save_profile(chat_id, u)
+            u["step"] = None
+            u["is_editing"] = False
+            ctx.reply(
+                "Город обновлён ✅",
+                keyboard=get_edit_keyboard(is_saved=True)
+            )
+        else:
+            u["step"] = "about"
+            ctx.reply(
+                f"Город выбран {city_name} ({region_name})\nНапишите немного о себе:",
+                keyboard=None
+            )
+
+        return True
+        
+    elif ctx.payload == "city":
+        # Редактируем город
+        u["step"] = "city_search"
+        ctx.reply("Введите город:")
+
+    elif ctx.payload == "about":
+        # Редактируем “О себе”
+        u["step"] = "about"
+        ctx.reply("Напишите о себе:")
+
+    elif ctx.payload == "photo":
+        # Редактируем фото
+        u["step"] = "photo"
+        ctx.reply("Пришлите фото (картинка или ссылка):")
+
+
+    # =========================
+    #         РЕДАКТИРОВАНИЕ
+    # =========================
+
+
+    #--------Имя
+    elif ctx.payload in ("edit_name_save", "edit_name_profile"):
+        u["step"] = "edit_name"
+        u["editing_existing"] = ctx.payload.endswith("_profile")
+        u["is_editing"] = True
+        ctx.reply("Введите имя:")
+
+# ------------------ Редактирование пола ------------------
+    # ------------------ Кнопки "редактировать пол" ------------------
+    elif ctx.payload in ("edit_gender_save", "edit_gender_profile"):
+        chat_id = str(ctx.chat_id)
+        users.setdefault(chat_id, {"step": None, "mode": None})
+        u = users[chat_id]
+
+        # Включаем режим редактирования
+        u["mode"] = "edit"
+        u["step"] = "gender_select"
+        u["is_editing"] = True
+        u["editing_existing"] = ctx.payload.endswith("_profile")
+        u["return_keyboard"] = ctx.payload  # чтобы потом открыть правильную клавиатуру
+
+        ctx.reply("Выберите пол:", keyboard=gender_keyboard)
+        return True
+
+    # ------------------ Выбор пола ------------------
+    elif ctx.payload in ("gender_m", "gender_f"):
+        chat_id = str(ctx.chat_id)
+        u = users.get(chat_id)
+        if not u:
+            return True
+        # используем универсальную функцию
+        return process_gender_selection(ctx, chat_id, ctx.payload)
+
+
+
+       
+# ------------------ Колбек для редактирования даты рождения ------------------
+    elif ctx.payload in ("edit_birthdate_save", "edit_birthdate_profile"):
+        print(f"[DEBUG CALLBACK] Нажата кнопка редактирования даты рождения, payload={ctx.payload}")
+
+        chat_id = str(ctx.chat_id)
+        users.setdefault(chat_id, {"step": None})
+        u = users[chat_id]
+
+        u["step"] = "edit_birth_day"
+        u["is_editing"] = True  # <- важно, чтобы text_steps шёл в handle_profile_edit
+        u["editing_existing"] = ctx.payload.endswith("_profile")
+
+        print(f"[DEBUG] Шаг установлен: {u['step']}, редактируем существующую анкету: {u['editing_existing']}")
+
+        ctx.reply("Введите день рождения (1-31):")  
+    
+    
+    
+    
+# ------------------ Колбек для редактирования города ------------------    
+
+
+    elif ctx.payload in ("edit_city_save", "edit_city_profile"):
+        print(f"[DEBUG CALLBACK] Нажата кнопка редактирования города: {ctx.payload}")
+
+        u["step"] = "edit_city_search_"
+        u["is_editing"] = True
+        u["editing_existing"] = ctx.payload.endswith("_profile")
+
+        ctx.reply("Введите название города:")
+        return True     
+
+        
+        
+
+# Колбек для редактирования "О себе"
+    # ------------------ О себе ------------------
+    elif ctx.payload in ("edit_about_save", "edit_about_profile"):
+        chat_id = str(ctx.chat_id)
+        users.setdefault(chat_id, {"step": None})
+        u = users[chat_id]
+        u["step"] = "edit_about"
+        u["is_editing"] = True
+        u["editing_existing"] = ctx.payload.endswith("_profile")
+        ctx.reply("Напишите о себе:")
+
+
+# ------------------ Фото ------------------
+    elif ctx.payload in ("edit_photo_save", "edit_photo_profile"):
+        print(f"[DEBUG CALLBACK] Нажата кнопка редактирования фото, payload={ctx.payload}")
+
+        chat_id = str(ctx.chat_id)
+        users.setdefault(chat_id, {"step": None})
+        u = users[chat_id]
+
+        u["step"] = "edit_photo"
+        u["is_editing"] = True
+        u["editing_existing"] = ctx.payload.endswith("_profile")
+
+        print(f"[DEBUG] Шаг установлен: {u['step']}, редактируем существующую анкету: {u['editing_existing']}")
+
+        ctx.reply("Отправьте новое фото:")
+
+
+
+    # =========================
+    #         ФИЛЬТРЫ
+    # =========================
+
     elif ctx.payload == "open_filters":
-        # Открытие фильтров
         show_filters(ctx)
+
     elif ctx.payload == "gender_filters":
-        # Выбор пола
-        ctx.reply("Выберите пол для фильтров:", keyboard=gender_filters)
+        ctx.reply("Выберите пол:", keyboard=gender_filters)
+
     elif ctx.payload == "age_filters":
-        # Выбор возраста
         profile = get_profile(chat_id) or {}
         min_age = profile.get("filters_age_min", MIN_AGE_LIMIT)
         max_age = profile.get("filters_age_max", MAX_AGE_LIMIT)
-        ctx.reply("Выберите возраст для фильтров:", keyboard=age_keyboard_filters(min_age, max_age))
+
+        ctx.reply(
+            "Выберите возраст:",
+            keyboard=age_keyboard_filters(min_age, max_age)
+        )
+
     elif ctx.payload == "city_filters":
-        # Выбор города фильтр
         u["step"] = "city_search"
         u["city_mode"] = "filters"
-        ctx.reply("Введите первые буквы города для фильтра:")
+        ctx.reply("Введите первые буквы города:")
+
     elif ctx.payload == "done_filters":
-        # Завершаем установку фильтров
-        ctx.reply("Фильтры сохранены ✅", keyboard=main_menu(get_profile(chat_id)))
-    elif ctx.payload in ("gender_filter_m", "gender_filter_f", "gender_filter_any"):
-        # Устанавливаем фильтр по полу
+        profile = get_profile(chat_id)
+        show_filters(ctx)  # Показываем фильтры заново с текущими значениями
+
+    elif ctx.payload in (
+        "gender_filter_m",
+        "gender_filter_f",
+        "gender_filter_any"
+    ):
+
         value = {
             "gender_filter_m": "М",
             "gender_filter_f": "Ж",
             "gender_filter_any": "Любой"
         }[ctx.payload]
+
         update_filter(chat_id, "filters_gender", value)
-        profile = get_profile(chat_id) or {}
-        ctx.reply("⚙️ Ваши фильтры:", keyboard=keyboard_filters(profile))
+
+        show_filters(ctx)
+
     elif ctx.payload in (
         "age_min_minus", "age_min_plus",
         "age_max_minus", "age_max_plus"
     ):
-        # Обновляем диапазон возрастов
+
         profile = get_profile(chat_id) or {}
         min_age = profile.get("filters_age_min", MIN_AGE_LIMIT)
         max_age = profile.get("filters_age_max", MAX_AGE_LIMIT)
@@ -1534,192 +2569,44 @@ def handle_callback(ctx):
             max_age = max(min_age, max_age - 1)
         elif ctx.payload == "age_max_plus":
             max_age = min(MAX_AGE_LIMIT, max_age + 1)
+
         update_filter(chat_id, "filters_age_min", min_age)
         update_filter(chat_id, "filters_age_max", max_age)
-        ctx.reply("Выберите возраст для фильтров:", keyboard=age_keyboard_filters(min_age, max_age))
-    elif ctx.payload.startswith("profile_city:"):
-        # Пользователь выбрал город
-        _, city_data = ctx.payload.split(":", 1)
-        city, region = city_data.split("|")
-        u["city"] = city
-        u["region"] = region
-        u["step"] = "about"
-        ctx.reply(f"🏙 Город выбран: {city} ({region}).\nРасскажите немного о себе:")
-    elif ctx.payload == "age_yes":
-        # Пользователь подтвердил возраст
-        u["step"] = "name"
-        ctx.reply("Введите ваше имя:")
-    elif ctx.payload == "age_no":
-        # Пользователь не достиг 18 лет
-        ctx.reply("Вы недостаточно взрослые для участия. До свидания!")
-    elif ctx.payload == "gender_m":
-        # Пользователь выбрал мужской пол
-        u["gender"] = "М"
-        u["step"] = "birth_day"
-        ctx.reply("Введите день рождения (1–31):")
-    elif ctx.payload == "gender_f":
-        # Пользователь выбрал женский пол
-        u["gender"] = "Ж"
-        u["step"] = "birth_day"
-        ctx.reply("Введите день рождения (1–31):")
-    elif ctx.payload.startswith("city_selected:"):
-        # === ВЫБОР ГОРОДА ===
-        _, city_data = ctx.payload.split(":", 1)
-        city, region = city_data.split("|")
-        mode = u.get("city_mode")
-        # === СОЗДАНИЕ АНКЕТЫ ===
-        if mode == "profile_create":
-            u["city"] = city
-            u["region"] = region
-            u["step"] = "about"
-            u["city_mode"] = None
-            ctx.reply(
-                f"🏙 Город выбран: {city} ({region})\n\n"
-                "Расскажите немного о себе:"
-            )
-            return
 
-        # === РЕДАКТИРОВАНИЕ ПРОФИЛЯ ===
-        if mode == "profile_edit":
-            conn = sqlite3.connect(DB_FILE)
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE profiles SET city=?, region=? WHERE user_id=?",
-                (city, region, chat_id)
-            )
-            conn.commit()
-            conn.close()
-
-            u["city_mode"] = None
-            ctx.reply(f"🏙 Город обновлён: {city} ({region})", keyboard=edit_keyboard)
-            return
-
-        # === ФИЛЬТРЫ ===
-        if mode == "filters":
-            update_filter(chat_id, "filters_city", city)
-            update_filter(chat_id, "filters_region", region)
-
-            u["city_mode"] = None
-            u["step"] = None
-
-            ctx.reply(
-                f"🏙 Фильтр города установлен: {city}",
-                keyboard=keyboard_filters(get_profile(chat_id))
-            )
-            return
-
-    elif ctx.payload == "edit_city":
-        # Редактирование города
-        u["step"] = "city_search"
-        u["city_mode"] = "profile_edit"
-        ctx.reply("Введите первые буквы нового города:")
-    elif ctx.payload == "delete":
-        # Пользователь хочет удалить профиль
-        ctx.reply("Вы уверены, что хотите удалить анкету?", keyboard=delete_confirm_keyboard)
-    elif ctx.payload == "edit":
-        # Пользователь хочет редактировать профиль
-        ctx.reply("Редактирование профиля:", keyboard=edit_keyboard)
-    elif ctx.payload == "save":
-        # Пользователь сохраняет профиль
-        save_profile(chat_id, u)
-        ctx.reply("Профиль успешно сохранён!", keyboard=main_menu(get_profile(chat_id)))
-    elif ctx.payload == "delete_profile":
-        # Пользователь хочет удалить профиль
         ctx.reply(
-            "Анкета будет удалена через 30 дней.\n\n"
-            "Вы уверены, что хотите удалить анкету?",
-            keyboard=delete_confirm_keyboard
+            "Выберите возраст:",
+            keyboard=age_keyboard_filters(min_age, max_age)
         )
-    elif ctx.payload == "done_edit":
-        # Сохраняем изменения и показываем меню редактирования
-        save_profile(chat_id, u)  # сохраняем текущие данные пользователя
-        ctx.reply("Изменения сохранены!", keyboard=edit_keyboard)  # показываем клавиатуру редактирования
-    elif ctx.payload == "confirm_delete":
-        # Помечаем профиль на удаление
-        soft_delete_profile(chat_id)
-        # Получаем профиль заново
-        profile = get_profile(chat_id)
-        # Отправляем сообщение о пометке на удаление с клавиатурой восстановления
-        ctx.reply(
-            "⚠️ Ваша анкета помечена на удаление. Восстановить?", 
-            keyboard=restore_keyboard
-        )
-    elif ctx.payload == "cancel_delete":
-        # Пользователь отменяет удаление профиля
-        ctx.reply("Удаление отменено.", keyboard=main_menu(get_profile(chat_id)))
-    elif ctx.payload == "show_offer":
-        # Пользователь запрашивает оферту
-        ctx.reply(OFFER_TEXT, keyboard=vip_offer_keyboard)
-    elif ctx.payload == "offer_accept":
-        # Пользователь согласился с офертой
-        ctx.reply("💎 Выбирайте тариф для подписки", keyboard=vip_keyboard)
-    elif ctx.payload == "offer_decline":
-        # Пользователь отказался от оферты
-        profile = get_profile(str(ctx.chat_id))
-        ctx.reply(
-            "❌ Вы не приняли условия оферты.\n\n"
-            "VIP-функции недоступны.",
-            keyboard=main_menu(profile)
-        )
-    elif ctx.payload == "back":
-        # Пользователь вернулся назад
-        u["step"] = None
-        ctx.reply("Главное меню:", keyboard=main_menu(get_profile(chat_id)))
-    elif ctx.payload == "edit_name":
-        # Редактирование имени
-        u["step"] = "edit_name"
-        ctx.reply("Введите новое имя:")
-    elif ctx.payload == "edit_gender":
-        # Редактирование пола
-        u["step"] = "edit_gender"
-        ctx.reply("Выберите новый пол:", keyboard=gender_keyboard)
-    elif ctx.payload == "edit_birthdate":
-        # Редактирование даты рождения
-        u["step"] = "edit_birthdate"
-        ctx.reply("Введите день рождения (1–31):")
-    elif ctx.payload == "edit_photo":
-        # Редактирование фотографии
-        u["step"] = "edit_photo"
-        ctx.reply("Загрузите новое фото (пришлите вложением или ссылкой):")
-    elif ctx.payload == "edit_about":
-        # Редактирование информации о себе
-        u["step"] = "edit_about"
-        ctx.reply("Расскажите немного о себе:")
-    elif ctx.payload == "edit_done":
-        # Сохранение изменений в профиле
-        save_profile(chat_id, u)
-        ctx.reply("Изменения сохранены!", keyboard=main_menu(get_profile(chat_id)))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     elif ctx.payload == "back_to_menu":
         # Возвращение в главное меню
         u["step"] = None
-        ctx.reply("Главное меню:", keyboard=main_menu(get_profile(chat_id)))
+        text, keyboard = main_menu(get_profile(chat_id), chat_id)
+        ctx.reply(text, keyboard=keyboard)
     elif ctx.payload == "edit_profile":
         # Переход в режим редактирования профиля
-        ctx.reply("Что вы хотите изменить?", keyboard=edit_keyboard)
-    elif ctx.payload == "ruletka":
-        # Запуск чата-рулетки
-        ctx.reply(
-            "💬 Чат-рулетка готова. Выберите действие:",
-            keyboard=ruletka_keyboard
-        )
-    elif ctx.payload == "vip_tariv":
-        # Просмотр тарифов VIP
-        ctx.reply("💎 Выберите тариф для подписки", keyboard=vip_keyboard)
-    elif ctx.payload == "restore_profile":
-        profile = get_profile(chat_id)
-        if profile.get("deleted_at"):
-            # Снимаем пометку удаления
-            conn = sqlite3.connect(DB_FILE)
-            cursor = conn.cursor()
-            cursor.execute("UPDATE profiles SET deleted_at=NULL WHERE user_id=?", (chat_id,))
-            conn.commit()
-            conn.close()
-            ctx.reply("♻ Ваша анкета восстановлена!", keyboard=main_menu(profile))
-        else:
-            ctx.reply("Анкета не была удалена или уже восстановлена.", keyboard=main_menu(profile))
-    elif ctx.payload == "cancel_restore":
-        # Пользователь отказался восстановить
-        ctx.reply("❌ Анкета не восстановлена.", keyboard=restore_keyboard)
+        ctx.reply("Что вы хотите изменить?", keyboard=get_edit_keyboard(is_saved=False))
+    elif ctx.payload == "edit_profile_after_creation":
+        u["step_edit"] = True
+        u["step"] = None
+        ctx.reply("Что вы хотите изменить?", keyboard=get_edit_keyboard(is_saved=True))
+
+
     elif ctx.payload == "ruletka":
         # Запуск чата-рулетки
         ctx.reply(
@@ -1727,286 +2614,382 @@ def handle_callback(ctx):
             keyboard=ruletka_keyboard
         )
     elif ctx.payload == "roulette_in":
-        roulette_in(ctx)
+        asyncio.create_task(roulette_in(ctx))
+
+
+
     elif ctx.payload == "roulette_out":
-        roulette_out(ctx)
+        asyncio.create_task(roulette_out(str(ctx.chat_id)))
+
+
+
+
+
+
+
+    elif ctx.payload == "vip_tariv":
+        # Просмотр тарифов VIP
+        ctx.reply("💎 Выберите тариф для подписки", keyboard=vip_keyboard)
+    
+    
+    
+    elif ctx.payload == "restore_profile":
+        profile = get_profile(chat_id)
+
+        if profile and profile.get("deleted_at"):
+                # Снимаем пометку удаления
+                conn = sqlite3.connect(DB_FILE)
+                cursor = conn.cursor()
+                cursor.execute(
+                        "UPDATE profiles SET deleted_at=NULL WHERE user_id=?",
+                        (chat_id,)
+                )
+                conn.commit()
+                conn.close()
+
+                # Получаем обновлённый профиль
+                profile = get_profile(chat_id)
+
+                text, keyboard = main_menu(profile, chat_id)
+                ctx.reply(
+                        f"♻ Ваша анкета восстановлена!\n\n{text}",
+                        keyboard=keyboard
+                )
+        else:
+                text, keyboard = main_menu(profile, chat_id)
+                ctx.reply(
+                        f"Анкета не была удалена или уже восстановлена.\n\n{text}",
+                        keyboard=keyboard
+                )
+
+
+
+    elif ctx.payload == "cancel_restore":
+        # Пользователь отказался восстановить
+        ctx.reply("❌ Анкета не восстановлена.", keyboard=restore_keyboard)
+
+    
+    
+
+
     elif ctx.payload == "admin_timer":
         current = get_chat_timer()
         ctx.reply(
             f"⏳ Текущий таймер: {current} сек.\n"
             "Введите новое значение:"
         )
-        # сохраняем состояние
         user_states[str(ctx.chat_id)] = "waiting_timer"
+    elif payload == "age_yes":
+        users[chat_id]["step"] = "name"
+        ctx.reply("✅ Отлично! Продолжаем…\nВведите ваше имя:")
+    elif payload == "age_no":
+        ctx.reply("🚫 К сожалению, доступ запрещён.")
+    elif payload == "restore_profile":
+        ctx.reply("✅ Анкета восстановлена!")
+        
+    # ------------------ Кнопка Готово ------------------
+    elif ctx.payload in ("edit_save_profile", "edit_done_create", "open_profile", "cancel_menu_delete"):
+        print(f"[DEBUG CALLBACK] Нажата кнопка Готово, payload={ctx.payload}")
+
+        chat_id = str(ctx.chat_id)
+        u = users.get(chat_id, {})
+        u["step"] = None
+        u["is_editing"] = False
+
+        # Сохраняем профиль
+        save_profile(chat_id, u)
+        print(f"[DEBUG CALLBACK] Профиль сохранён для chat_id={chat_id}")
+
+        # Получаем обновлённый профиль
+        user_profile = get_profile(chat_id)
+        print(f"[DEBUG CALLBACK] user_profile загружен: {user_profile}")
+
+        # ------------------ Готово 2 ------------------
+        if ctx.payload in ("edit_save_profile", "cancel_menu_delete"):
+            print("[DEBUG CALLBACK] Показываем save_menu")
+            keyboard = save_menu  # если это объект
+            # keyboard = save_menu(user_profile)  # если это функция
+            show_profile(ctx, user_profile, keyboard)
+
+        # ------------------ Готово 1 ------------------
+        else:
+            print("[DEBUG CALLBACK] Показываем profile_menu")
+            keyboard = profile_menu  # если объект
+            # keyboard = profile_menu(user_profile)  # если это функция
+            show_profile(ctx, user_profile, keyboard)
+
+        return True
+
+
+        
+        
+        
+        
     else:
         print("Необработанный колбэк:", ctx.payload)
 		
+ 
+
+        
+        
+        
+
+
+
+
 # ================== РУЛЕТКА ==================
 @bot.command("roulette")
-#Фильтры
-def get_filters(user_id):
-    """
-    Получение фильтров пользователя из БД (город, пол).
-    Если фильтры не заданы — возвращает пустой словарь.
-    """
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT filters_city, filters_gender
-        FROM profiles
-        WHERE user_id=?
-    """, (user_id,))
-    
-    row = cursor.fetchone()
-    conn.close()
-    
-    if not row:
-        return {}
-    
-    city, gender = row
-    filters = {}
-    if city:
-        filters["city"] = city
-    if gender:
-        filters["gender"] = gender
-    return filters
+
+# ================== ТАЙМЕР ==================
+# ================== ТАЙМЕР ЧАТА ==================
+async def chat_timer(u1, u2):
+    timer_seconds = get_chat_timer()
+    await asyncio.sleep(timer_seconds)
+
+    # Проверка, что чат всё ещё активен
+    if active_chats.get(u1) != u2:
+        return
+
+    p1 = get_profile(u1)
+    p2 = get_profile(u2)
+    if not p1 or not p2:
+        return
+
+    # VIP освобождает от таймера
+    if is_vip(p1) or is_vip(p2):
+        return
+
+    # Закрываем чат
+    active_chats.pop(u1, None)
+    active_chats.pop(u2, None)
+
+    minutes_str = minutes_text(timer_seconds)
+
+    # Сообщения для пользователей
+    msg1 = (
+        f"⏳ Бесплатные {minutes_str} закончились!\n\n"
+        f"💬 {p2.get('name')} всё ещё онлайн...\n"
+        f"Не упусти шанс продолжить разговор 🔥\n\n"
+        f"💎 Активируй VIP и общайся без ограничений:"
+    )
+    msg2 = (
+        f"⏳ Бесплатные {minutes_str} закончились!\n\n"
+        f"💬 {p1.get('name')} всё ещё онлайн...\n"
+        f"Не упусти шанс продолжить разговор 🔥\n\n"
+        f"💎 Активируй VIP и общайся без ограничений:"
+    )
+
+    # Исправленный формат клавиатуры (список словарей, не вложенные списки)
+    keyboard = InlineKeyboard(
+        [{"text": "💎 Продолжить без ограничений", "callback": "vip"}],  # первая строка
+        [
+            {"text": "🔄 Найти нового собеседника", "callback": "ruletka"},
+            {"text": "📩 Пригласить друга 🎁", "callback": "invite"}
+        ]  # вторая строка с двумя кнопками
+    )
+
+    # Отправка первого сообщения (без ошибок)
+    if u1 in contexts:
+        contexts[u1].reply(msg1)  # 🔹 клавиатуру не прикрепляем
+    if u2 in contexts:
+        contexts[u2].reply(msg2)  # 🔹 клавиатуру не прикрепляем
+
+    # Небольшая пауза перед повторным напоминанием
+    await asyncio.sleep(2)
+
+    # Второе напоминание с клавиатурой
+    reminder1 = (
+        f"🔥 {p2.get('name')} всё ещё онлайн! "
+        f"Активируйте VIP и не упустите разговор!\n"
+    )
+    reminder2 = (
+        f"🔥 {p1.get('name')} всё ещё онлайн! "
+        f"Активируйте VIP и не упустите разговор!\n"
+    )
+
+    if u1 in contexts:
+        contexts[u1].reply(reminder1, keyboard=keyboard)  # 🔹 с клавиатурой
+    if u2 in contexts:
+        contexts[u2].reply(reminder2, keyboard=keyboard)  # 🔹 с клавиатурой
 
 
-# --------------------- Вход в рулетку
-def roulette_in(ctx):
+
+# ================== roulette_in ==================
+
+async def roulette_in(ctx):
     user_id = str(ctx.chat_id)
-
-    # === Получаем профиль и фильтры из БД ===
+    
+    print(f"[SEARCH START] {user_id}") 
+    
+    contexts[user_id] = ctx
     profile = get_profile(user_id)
+
     if not profile:
         ctx.reply("❗ Профиль не найден. Сначала заполните анкету.")
         return
 
     filters = get_filters(user_id)
+    print(f"[USER FILTERS] {user_id}: {filters}")
     if not filters or not filters.get("city"):
         ctx.reply("❗ Выберите город в фильтрах")
         return
 
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    if user_id in active_chats:
+        ctx.reply("❗ Вы уже в чате")
+        return
 
-    try:
-        # === Проверка, есть ли пользователь уже в активном чате ===
-        cursor.execute(
-            "SELECT user1, user2 FROM active_chats WHERE user1=? OR user2=?",
-            (user_id, user_id)
-        )
-        if cursor.fetchone():
-            ctx.reply("❗ Вы уже в чате")
-            return
+    # Добавляем в очередь VIP вперед, обычные — в конец
+    if is_vip(profile):
+        await redis_client.lpush(QUEUE_KEY, user_id)
+    else:
+        await redis_client.rpush(QUEUE_KEY, user_id)
 
-        # === Проверка, есть ли пользователь в очереди ===
-        cursor.execute(
-            "SELECT 1 FROM roulette_queue WHERE user_id=?",
-            (user_id,)
-        )
-        if cursor.fetchone():
-            ctx.reply("⏳ Вы уже в очереди")
-            return
+    ctx.reply("🔎 Ищем собеседника...", keyboard=ruletka_keyboard)
 
-        # === Поиск партнёра в очереди ===
+    # Поиск партнёра
+    while True:
+        if user_id in active_chats:
+            print(f"[STOP SEARCH] {user_id} уже в чате")
+            break
+    
+        if user_id in active_chats:
+            print(f"[STOP SEARCH] {user_id} уже в чате")
+            break
+    
+        candidates = await redis_client.lrange(QUEUE_KEY, 0, -1)
         partner_id = None
-        cursor.execute(
-            "SELECT rq.user_id FROM roulette_queue rq "
-            "JOIN profiles p ON rq.user_id=p.user_id "
-            "WHERE rq.user_id!=?",
-            (user_id,)
-        )
-        candidates = cursor.fetchall()
 
         for candidate in candidates:
-            cand_id = candidate[0]
-            cand_profile = get_profile(cand_id)
-            cand_filters = get_filters(cand_id)
-
-            if not cand_profile:
+            if candidate == user_id:
                 continue
 
-            # Фильтр по городу
-            if cand_profile.get("city") != filters.get("city"):
+            partner_profile = get_profile(candidate)
+            partner_filters = get_filters(candidate)
+
+            if not partner_profile or not partner_filters:
                 continue
 
-            # Фильтр по полу
-            if filters.get("gender") and filters["gender"] != "Любой":
-                if cand_profile.get("gender") != filters.get("gender"):
+            # === Фильтры города и пола ===
+            partner_city_filter = partner_filters.get("city")
+            user_city_filter = filters.get("city")
+
+            if partner_city_filter != "Любой" and partner_city_filter != profile.get("city"):
+                continue
+
+            if user_city_filter != "Любой" and user_city_filter != partner_profile.get("city"):
+                continue
+            
+            
+            
+            
+            #if partner_filters.get("city") != profile.get("city"):
+            #    continue
+            if partner_filters.get("gender") and partner_filters.get("gender") != "Любой":
+                if profile.get("gender") != partner_filters.get("gender"):
                     continue
 
-            # Взаимная проверка города и пола
-            if cand_filters:
-                if cand_filters.get("city") != profile.get("city"):
-                    continue
-                if cand_filters.get("gender") and cand_filters["gender"] != "Любой":
-                    if profile.get("gender") != cand_filters["gender"]:
-                        continue
+            # === Фильтры возраста (двусторонние) ===
+            user_age = profile.get("age", 0)
+            partner_age = partner_profile.get("age", 0)
 
-            partner_id = cand_id
+            user_age_min = filters.get("age_min", 0)
+            user_age_max = filters.get("age_max", 0)
+            partner_age_min = partner_filters.get("age_min", 0)
+            partner_age_max = partner_filters.get("age_max", 0)
+
+            if not (user_age_min <= partner_age <= user_age_max):
+                continue
+            if not (partner_age_min <= user_age <= partner_age_max):
+                continue
+
+            partner_id = candidate
             break
 
-        now = int(time.time())
-
         if partner_id:
-            # === Создаем чат в базе и удаляем из очереди ===
-            cursor.execute(
-                "DELETE FROM roulette_queue WHERE user_id IN (?, ?)",
-                (user_id, partner_id)
-            )
-            cursor.execute(
-                "INSERT INTO active_chats (user1, user2, started_at) VALUES (?, ?, ?)",
-                (user_id, partner_id, now)
-            )
-            conn.commit()
+            # Удаляем из очереди
+            await redis_client.lrem(QUEUE_KEY, 0, partner_id)
+            await redis_client.lrem(QUEUE_KEY, 0, user_id)
 
-            # === Статистика ===
-            increment_stat(user_id, "chats_started")
-            increment_stat(partner_id, "chats_started")
+            # === Лог и уведомления ===
+            log.info(f"[Connect] {user_id} ↔ {partner_id}")
+            ctx.reply("✨ Собеседник найден! Начните общение 👋")
+            if partner_id in contexts:
+                contexts[partner_id].reply("✨ Собеседник найден! Начните общение 👋")
 
-            # === Сообщения участникам ===
-            user_profile = profile
+            # Получаем профили для анкет
+            user_profile = get_profile(user_id)
             partner_profile = get_profile(partner_id)
 
-            def get_emoji(p):
-                if not p: return "👤"
-                if p.get("gender") == "М": return "👨"
-                if p.get("gender") == "Ж": return "👩"
-                return "👤"
-
             leave_keyboard = InlineKeyboard(
-                [{"text": "⏹ Выйти из чата", "callback": "roulette_out"}]
+                [{"text": "⏹ Выйти из чата", "callback": "leave_chat"}]
             )
 
-            ctx.reply(
-                f"{get_emoji(partner_profile)} Анкета собеседника:\n\n"
-                f"Имя: {partner_profile.get('name')}\n"
-                f"Пол: {partner_profile.get('gender')}\n"
-                f"🎂 Дата рождения: {partner_profile.get('birthdate')}\n"
-                f"🎈 Возраст: {partner_profile.get('age')}\n"
-                f"🏙 Город: {partner_profile.get('city')}\n"
-                f"✍️ О себе: {partner_profile.get('about')}\n"
-                f"💎 VIP: {'да' if partner_profile.get('is_vip') else 'нет'}\n"
-                f"📸 Фото:\n{partner_profile.get('photo_url')}",
-                keyboard=leave_keyboard
-            )
+            # Анкета партнёра для пользователя
+            if partner_profile:
+                show_profile(ctx, partner_profile, keyboard=leave_keyboard)
 
-            if partner_id in contexts:
-                contexts[partner_id].reply(
-                    f"{get_emoji(user_profile)} Анкета собеседника:\n\n"
-                    f"Имя: {user_profile.get('name')}\n"
-                    f"Пол: {user_profile.get('gender')}\n"
-                    f"🎂 Дата рождения: {user_profile.get('birthdate')}\n"
-                    f"🎈 Возраст: {user_profile.get('age')}\n"
-                    f"🏙 Город: {user_profile.get('city')}\n"
-                    f"✍️ О себе: {user_profile.get('about')}\n"
-                    f"💎 VIP: {'да' if user_profile.get('is_vip') else 'нет'}\n"
-                    f"📸 Фото:\n{user_profile.get('photo_url')}",
-                    keyboard=leave_keyboard
-                )
-
-            # === Запускаем таймер чата через БД ===
-            threading.Thread(
-                target=chat_timer,
-                args=(user_id, partner_id),
-                daemon=True
-            ).start()
-
-            ctx.reply("✨ Собеседник найден! Начните общение 👋")
+            # Анкета пользователя для партнёра
+            if user_profile and partner_id in contexts:
+                show_profile(contexts[partner_id], user_profile, keyboard=leave_keyboard)
+            # Запускаем чат
+            print(f"[CONNECT] {user_id} ↔ {partner_id}") 
+            await start_chat(user_id, partner_id)
+            # Запускаем таймер в фоне
+            asyncio.create_task(chat_timer(user_id, partner_id))
+            break
 
         else:
-            # === Никого нет — добавляем в очередь ===
-            cursor.execute(
-                "INSERT INTO roulette_queue (user_id, joined_at) VALUES (?, ?)",
-                (user_id, now)
-            )
-            conn.commit()
-            ctx.reply("🔎 Ищем собеседника...")
+            # Если очередь пуста, ждём 1 сек
+            await asyncio.sleep(1)
 
-    finally:
-        conn.close()
+# ================== ВЫХОД ==================
+async def roulette_out(user_id):
+    partner = active_chats.get(user_id)
 
+    # ===== Если пользователь уже не в чате =====
+    if not partner:
+        if user_id in contexts:
+            profile = get_profile(user_id)
+            header_text, keyboard = main_menu(profile, user_id)
 
-# --------------------- Выход из чата
-def roulette_out(ctx):
-    user_id = str(ctx.chat_id)
-    partner_id = None
+            final_text = f"❌ Вы не в чате\n\n{header_text}"
+            contexts[user_id].reply(final_text, keyboard=keyboard)
+        return
 
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
+    # ===== Удаляем обоих из активных чатов =====
+    active_chats.pop(user_id, None)
+    active_chats.pop(partner, None)
 
-        # === Проверяем активный чат ===
-        cursor.execute(
-            "SELECT user1, user2 FROM active_chats WHERE user1=? OR user2=?",
-            (user_id, user_id)
-        )
-        row = cursor.fetchone()
+    # ===== Пользователь =====
+    if user_id in contexts:
+        profile = get_profile(user_id)
+        header_text, keyboard = main_menu(profile, user_id)
 
-        if row:
-            user1, user2 = row
-            partner_id = user2 if user1 == user_id else user1
+        final_text = f"❌ Вы вышли из чата\n\n{header_text}"
+        contexts[user_id].reply(final_text, keyboard=keyboard)
 
-            # Удаляем активный чат
-            cursor.execute(
-                "DELETE FROM active_chats WHERE user1=? OR user2=?",
-                (user_id, user_id)
-            )
-            conn.commit()
+    # ===== Партнёр =====
+    if partner in contexts:
+        profile = get_profile(partner)
+        header_text, keyboard = main_menu(profile, partner)
 
-            # Обновляем статистику
-            increment_stat(user_id, "chats_finished")
-            if partner_id:
-                increment_stat(partner_id, "chats_finished")
+        final_text = f"❗ Собеседник вышел из чата\n\n{header_text}"
+        contexts[partner].reply(final_text, keyboard=keyboard)
 
-            # Сообщение пользователю
-            ctx.reply(
-                "❌ Вы вышли из чата",
-                keyboard=main_menu(get_profile(user_id))
-            )
-
-            # Сообщение партнёру (если он онлайн)
-            if partner_id and partner_id in contexts:
-                contexts[partner_id].reply(
-                    "❗ Ваш собеседник вышел из чата",
-                    keyboard=main_menu(get_profile(partner_id))
-                )
-
-            # Очистка локальных структур
-            contexts.pop(user_id, None)
-            user_states.pop(user_id, None)
-            return
-
-        # === Проверяем очередь ===
-        cursor.execute(
-            "SELECT 1 FROM roulette_queue WHERE user_id=?",
-            (user_id,)
-        )
-        if cursor.fetchone():
-            cursor.execute(
-                "DELETE FROM roulette_queue WHERE user_id=?",
-                (user_id,)
-            )
-            conn.commit()
-            ctx.reply(
-                "❌ Вы вышли из очереди",
-                keyboard=main_menu(get_profile(user_id))
-            )
-            return
-
-        # === Пользователь нигде не был ===
-        ctx.reply(
-            "❌ Вы не в чате и не в очереди",
-            keyboard=main_menu(get_profile(user_id))
-        )
-
-    finally:
-        conn.close()
-
+    # ===== Очистка памяти =====
+    contexts.pop(user_id, None)
+    contexts.pop(partner, None)
 
 # ================== АДМИН ПАНЕЛЬ ==================
+
+
+
+
+
+
+
+
+# ================== Админ панель ==================
 @bot.command("admin")
 def show_admin_panel(ctx):
     if str(ctx.chat_id) != str(ADMIN_ID):
@@ -2049,10 +3032,16 @@ def admin_keyboard(profile):
 
     return InlineKeyboard(
         [vip_button],
-        [{"text": "⏳ Таймер чата", "callback": "admin_timer"}], 
+        [{"text": "⏳ Таймер чата", "callback": "admin_timer"}],    
         [{"text": "🔄 Обновить", "callback": "admin_refresh"}],
         [{"text": "⬅ Назад", "callback": "back"}]
     )
+
+
+
+
+
+# ================== Функция статистики ==================
 # ================== Функция статистики ==================
 def get_stats():
     now = int(time.time())
@@ -2100,7 +3089,9 @@ def get_stats():
 
 
     # ================== РУЛЕТКА ==================
-        # В очереди
+    # ⚠ Поменяй названия таблиц если у тебя другие!
+
+    # В очереди
     cursor.execute("SELECT COUNT(*) FROM roulette_queue")
     stats["waiting_queue"] = cursor.fetchone()[0]
 
@@ -2160,6 +3151,44 @@ def log_chat_ended(user_id):
     cursor.execute("UPDATE roulette_stats SET chats_ended = chats_ended + 1 WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
+
+
+# Обработчик ввода нового значения таймера
+@bot.on("timerullete")
+def handle_timer_message(ctx):
+    chat_id = str(ctx.chat_id)
+    text = ctx.text
+
+    if user_states.get(chat_id) == "waiting_timer_value":
+        log.debug("Обработка таймера началась")
+        if not text.isdigit():
+            ctx.reply("❌ Введённое значение не является числом. Повторите попытку.")
+            return
+
+        seconds = int(text)
+        if seconds < 10:
+            ctx.reply("Минимальное значение таймера — 10 секунд.")
+            return
+
+        set_chat_timer(seconds)
+        ctx.reply(f"✅ Новый таймер установлен: {seconds} секунд", keyboard=admin_menu())
+        user_states.pop(chat_id, None)
+        log.debug("Обработка таймера закончилась")
+
+
+
+
+
+
+
+
+
+
+
+    
+
+
+
 
 # Главная функция старта
 if __name__ == "__main__":
