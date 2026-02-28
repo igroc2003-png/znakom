@@ -3,7 +3,6 @@ import logging
 import threading
 import time
 import asyncio
-import redis.asyncio as redis
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
 from datetime import datetime, timedelta
@@ -39,6 +38,7 @@ active_chats = {}              # Активные чаты рулетки: user_
 contexts = {}                  # Контексты пользователей для рулетки: user_id -> ctx
 chat_started_at = {}           # 👈 ВАЖНО (у тебя из-за этого была ошибка)
 buh_process = None             # глобальная переменная для процесса buh.py
+roulette_queue = []            # глобально в начале бота
 # Настройка YooKassa
 Configuration.account_id = YOOKASSA_SHOP_ID
 Configuration.secret_key = YOOKASSA_SECRET_KEY
@@ -48,15 +48,8 @@ TARIFFS = {
     "vip_180": {"days": 180, "price": 1500, "name": "VIP 6 месяцев"},
     "vip_365": {"days": 365, "price": 2500, "name": "VIP 12 месяцев"},
 }
-# ================= REDIS =================
-redis_client = redis.Redis(
-    host="localhost",
-    port=6379,
-    db=0,
-    decode_responses=True
-)
-QUEUE_KEY = "roulette_queue"
-async def start_chat(user1, user2):
+
+def start_chat(user1, user2):
     active_chats[user1] = user2
     active_chats[user2] = user1
     print(f"[CHAT STARTED] {user1} ↔ {user2}")
@@ -180,7 +173,7 @@ def main_menu(profile=None, chat_id=None):
         [{"text": "🎲 Начать общение", "callback": "ruletka"}],
         [{"text": "💎 VIP без ограничений", "callback": "vip"}],
         [{"text": f"{emoji} Моя анкета", "callback": "open_profile"}],
-        [{"text": "🎯 Фильтры (VIP)", "callback": "open_filters"}],
+        [{"text": "🎯 Фильтры поиска", "callback": "open_filters"}],
         [{"text": "📩 Пригласить друзей 🎁", "callback": "invite"}],
         [{"text": "🆘 Поддержка", "url": SUPPORT_URL}],
     ]
@@ -361,12 +354,12 @@ def get_edit_keyboard(is_saved=False):
     is_saved=True -> редактируем существующую анкету (профиль)
     """
     last_button = {
-        "text": "👍 Готово 2" if is_saved else "👍 Готово 1",
+        "text": "👍 Готово" if is_saved else "👍 Готово",
         "callback": "edit_save_profile" if is_saved else "edit_done_create"
     }
 
-    print(f"[DEBUG] Создаётся клавиатура редактирования, is_saved={is_saved}")
-    print(f"[DEBUG] Кнопка 'Готово': text='{last_button['text']}', callback='{last_button['callback']}'")
+    #print(f"[DEBUG] Создаётся клавиатура редактирования, is_saved={is_saved}")
+    #print(f"[DEBUG] Кнопка 'Готово': text='{last_button['text']}', callback='{last_button['callback']}'")
 
     return InlineKeyboard(
         [{"text": "📝 Имя", "callback": "edit_name_profile" if is_saved else "edit_name_save"},
@@ -502,7 +495,7 @@ def init_db():
     for column, definition in columns_to_add.items():
         if column not in existing_columns:
             cursor.execute(f"ALTER TABLE profiles ADD COLUMN {column} {definition};")
-            print(f"Добавлена колонка: {column}")
+           # print(f"Добавлена колонка: {column}")
 
     # ================= ACTIVE CHATS =================
     cursor.execute("""
@@ -590,17 +583,17 @@ def init_db():
         cursor.execute("ALTER TABLE profiles ADD COLUMN vip_until TEXT")
         cursor.execute("PRAGMA table_info(profiles);")
         columns = [col[1] for col in cursor.fetchall()]
-        print("✅ Колонка vip_until добавлена")
+       # print("✅ Колонка vip_until добавлена")
 
     if "invites" not in columns:
         cursor.execute("ALTER TABLE profiles ADD COLUMN invites INTEGER DEFAULT 0")
-        print("Добавлена колонка: invites")
+       # print("Добавлена колонка: invites")
 
     # Коммитим изменения
     conn.commit()
     conn.close()
 
-    print("✅ Все таблицы и колонки созданы/проверены")
+    #print("✅ Все таблицы и колонки созданы/проверены")
 
 # ------------------ Работа с таймером ------------------
 def get_referral_progress(user_id):
@@ -659,17 +652,20 @@ def get_profile(user_id):
     cursor = conn.cursor()
     cursor.execute("""
         SELECT user_id, name, gender, birthdate, age, city, about, photo_url,
-               filters_gender, filters_age_min, filters_age_max, filters_city
+               zodiac, is_vip, vip_until,
+               filters_gender, filters_age_min, filters_age_max, filters_city, invites
         FROM profiles
         WHERE user_id=?
     """, (user_id,))
     row = cursor.fetchone()
     conn.close()
+
     if not row:
         return None
 
     (user_id, name, gender, birthdate, age, city, about, photo_url,
-     filters_gender, filters_age_min, filters_age_max, filters_city) = row
+     zodiac, is_vip, vip_until,
+     filters_gender, filters_age_min, filters_age_max, filters_city, invites) = row
 
     return {
         "user_id": user_id,
@@ -680,10 +676,14 @@ def get_profile(user_id):
         "city": city,
         "about": about,
         "photo_url": photo_url,
+        "zodiac": zodiac,
+        "is_vip": bool(is_vip),
+        "vip_until": vip_until,
         "filters_gender": filters_gender,
         "filters_age_min": filters_age_min,
         "filters_age_max": filters_age_max,
-        "filters_city": filters_city
+        "filters_city": filters_city,
+        "invites": invites
     }
 
 def save_profile(user_id, new_data):
@@ -1108,12 +1108,12 @@ def create_profile_if_not_exists(user_id):
             INSERT INTO profiles (user_id, invites, vip_until)
             VALUES (?, 0, NULL)
         """, (user_id,))
-        print(f"PROFILE CREATED: {user_id}")
+      #  print(f"PROFILE CREATED: {user_id}")
         conn.commit()
     else:
-        print(f"PROFILE EXISTS: {user_id}")
+      #  print(f"PROFILE EXISTS: {user_id}")
 
-    conn.close()
+        conn.close()
 
 def process_referral(inviter_id, invited_id):
     """
@@ -1407,7 +1407,7 @@ def show_profile(ctx, profile, keyboard, zodiac_name=None, zodiac_sign=None):
     elif profile.get("gender") == "Ж":
         emoji = "👩"
 
-    # Знак зодиака с эмодзи
+    
     zodiac_name = profile.get("zodiac")
     zodiac_emoji = ZODIAC_SIGNS.get(zodiac_name, "") if zodiac_name else ""
     zodiac_display = f"{zodiac_emoji} {zodiac_name}" if zodiac_name else "Не указан"
@@ -1582,7 +1582,7 @@ def handle_profile_edit(ctx, u, step, text, attachments):
     # ------------------ Имя ------------------
     if step == "edit_name":
         if not text:
-            print("[DEBUG] Имя не введено, запрашиваем снова")
+         #   print("[DEBUG] Имя не введено, запрашиваем снова")
             ctx.reply("Введите имя:")
             return True
 
@@ -1614,7 +1614,7 @@ def handle_profile_edit(ctx, u, step, text, attachments):
             u["is_editing"] = False
 
             # Определяем, какая клавиатура была до выбора пола
-            print = u.get("return_keyboard")
+          #  print = u.get("return_keyboard")
             prev_payload = u.get("return_keyboard")
             if prev_payload in ("edit_gender_save", "edit_gender_profile"):
                 # Показываем profile_menu или save_menu в зависимости от payload
@@ -1631,14 +1631,14 @@ def handle_profile_edit(ctx, u, step, text, attachments):
 
     # ------------------ Обработка даты рождения в handle_profile_edit ------------------
     if step in ("edit_birth_day", "edit_birth_month", "edit_birth_year"):
-        print(f"[DEBUG] Шаг редактирования даты рождения: {step}")
-        print(f"[DEBUG] Ввод пользователя: {text}")
+     #   print(f"[DEBUG] Шаг редактирования даты рождения: {step}")
+      #  print(f"[DEBUG] Ввод пользователя: {text}")
 
         handle_birthdate(ctx, u, chat_id, step, text, creation=not u.get("editing_existing", False))
 
         # Проверяем, завершено ли редактирование
         if step == "edit_birth_year" and u.get("birthdate"):
-            print(f"[DEBUG] Дата рождения обновлена: {u['birthdate']}")
+         #   print(f"[DEBUG] Дата рождения обновлена: {u['birthdate']}")
             ctx.reply(
                 "Дата рождения обновлена ✅",
                 keyboard=get_edit_keyboard(is_saved=u.get("editing_existing", False))
@@ -1693,20 +1693,20 @@ def handle_profile_edit(ctx, u, step, text, attachments):
 
     # ------------------ О себе ------------------
     if step == "edit_about":
-        print(f"[DEBUG] Шаг редактирования 'О себе': {step}")
-        print(f"[DEBUG] Ввод пользователя: {text}")
+      #  print(f"[DEBUG] Шаг редактирования 'О себе': {step}")
+      #  print(f"[DEBUG] Ввод пользователя: {text}")
 
         if not text:
-            print("[DEBUG] Текст не введён, запрашиваем снова")
+      #      print("[DEBUG] Текст не введён, запрашиваем снова")
             ctx.reply("Напишите немного о себе:")
             return True
 
         u["about"] = text.strip()
-        print(f"[DEBUG] Поле 'О себе' обновлено во временном профиле: {u['about']}")
+      #  print(f"[DEBUG] Поле 'О себе' обновлено во временном профиле: {u['about']}")
 
         if u.get("editing_existing", False):
             save_profile(chat_id, u)
-            print(f"[DEBUG] Поле 'О себе' сохранено в базе для chat_id={chat_id}")
+       #     print(f"[DEBUG] Поле 'О себе' сохранено в базе для chat_id={chat_id}")
 
         ctx.reply(
             "О себе обновлено ✅",
@@ -1718,34 +1718,34 @@ def handle_profile_edit(ctx, u, step, text, attachments):
 
     # ------------------ Ввод фото ------------------
     if step == "edit_photo":
-        print(f"[DEBUG] Шаг редактирования фото: {step}")
-        print(f"[DEBUG] Вложения пользователя: {attachments}")
+    #    print(f"[DEBUG] Шаг редактирования фото: {step}")
+    #    print(f"[DEBUG] Вложения пользователя: {attachments}")
 
         if not attachments:
-            print("[DEBUG] Фото не отправлено, запрашиваем снова")
+     #       print("[DEBUG] Фото не отправлено, запрашиваем снова")
             ctx.reply("Отправьте фото:")
             return True
 
         # Сохраняем первую присланную фотку
         photo_url = attachments[0].get("payload", {}).get("url")
         if not photo_url:
-            print("[DEBUG] Ссылка на фото отсутствует, запрашиваем снова")
+        #    print("[DEBUG] Ссылка на фото отсутствует, запрашиваем снова")
             ctx.reply("Отправьте корректное фото:")
             return True
 
         u["photo_url"] = photo_url
-        print(f"[DEBUG] Фото обновлено во временном профиле: {photo_url}")
+    #    print(f"[DEBUG] Фото обновлено во временном профиле: {photo_url}")
 
         if u.get("editing_existing", False):
             save_profile(chat_id, u)
-            print(f"[DEBUG] Фото сохранено в базе для chat_id={chat_id}")
+      #      print(f"[DEBUG] Фото сохранено в базе для chat_id={chat_id}")
 
         # Показываем клавиатуру редактирования для следующего шага анкеты
         ctx.reply(
             "Фото обновлено ✅",
             keyboard=get_edit_keyboard(is_saved=u.get("editing_existing", False))
         )
-        print("[DEBUG] Клавиатура редактирования показана")
+     #   print("[DEBUG] Клавиатура редактирования показана")
 
         u["step"] = None
         return True
@@ -1842,38 +1842,38 @@ def relay(ctx):
     user_id = str(ctx.chat_id)
     contexts[user_id] = ctx
 
-    print("\n========== NEW MESSAGE ==========")
-    print(f"[DEBUG] user_id: {user_id}")
-    print(f"[DEBUG] payload: {ctx.payload}")
+ #   print("\n========== NEW MESSAGE ==========")
+  #  print(f"[DEBUG] user_id: {user_id}")
+  #  print(f"[DEBUG] payload: {ctx.payload}")
 
     text = ctx.message.get("text") or ctx.message.get("body", {}).get("text")
-    print(f"[DEBUG] raw text: {text}")
+ #   print(f"[DEBUG] raw text: {text}")
 
     # 🔹 1. Сначала шаги анкеты
     step_handled = text_steps(ctx)
-    print(f"[DEBUG] text_steps returned: {step_handled}")
+  #  print(f"[DEBUG] text_steps returned: {step_handled}")
 
     if step_handled:
-        print("[DEBUG] Сообщение обработано шагами анкеты")
+   #     print("[DEBUG] Сообщение обработано шагами анкеты")
         return
 
     # 🔹 2. Если это callback — выходим
     if ctx.payload:
-        print("[DEBUG] Это callback, выходим")
+   #     print("[DEBUG] Это callback, выходим")
         return
 
     # 🔹 3. Если не в чате — выходим
     if user_id not in active_chats:
-        print("[DEBUG] Пользователь не в активном чате")
+    #    print("[DEBUG] Пользователь не в активном чате")
         return
 
     partner_id = active_chats[user_id]
 
     if not text:
-        print("[DEBUG] Текста нет")
+      #  print("[DEBUG] Текста нет")
         return
 
-    print(f"[Relay] {user_id} -> {partner_id}: {text}")
+  #  print(f"[Relay] {user_id} -> {partner_id}: {text}")
 
     if partner_id in contexts:
         contexts[partner_id].reply(text)       
@@ -1884,30 +1884,30 @@ def text_steps(ctx):
     u = users[chat_id]
     step = u.get("step")
 
-    print(f"[DEBUG text_steps] step: {step}")
+  #  print(f"[DEBUG text_steps] step: {step}")
 
     if not step:
-        print("[DEBUG text_steps] step отсутствует")
+  #      print("[DEBUG text_steps] step отсутствует")
         return False
 
     text = ctx.message.get("text") or ctx.message.get("body", {}).get("text", "")
     attachments = ctx.message.get("body", {}).get("attachments", [])
 
-    print(f"[DEBUG text_steps] text: {text}")
-    print(f"[DEBUG text_steps] is_editing: {u.get('is_editing')}")
+  #  print(f"[DEBUG text_steps] text: {text}")
+  #  print(f"[DEBUG text_steps] is_editing: {u.get('is_editing')}")
 
     # ------------------ РЕДАКТИРОВАНИЕ ------------------
     if u.get("is_editing"):
-        print("[DEBUG text_steps] Переходим в handle_profile_edit")
+  #      print("[DEBUG text_steps] Переходим в handle_profile_edit")
         result = handle_profile_edit(ctx, u, step, text, attachments)
-        print(f"[DEBUG text_steps] handle_profile_edit вернул: {result}")
+  #      print(f"[DEBUG text_steps] handle_profile_edit вернул: {result}")
         return result
 
     # ------------------ СОЗДАНИЕ АНКЕТЫ ------------------
-    print("[DEBUG text_steps] Переходим в process_profile_creation")
+  #  print("[DEBUG text_steps] Переходим в process_profile_creation")
     process_profile_creation(ctx, u, text, attachments)
 
-    print("[DEBUG text_steps] Проверяем VIP команды")
+  #  print("[DEBUG text_steps] Проверяем VIP команды")
     handle_vip_commands(ctx, text)
 
     return True
@@ -2345,7 +2345,7 @@ def handle_callback(ctx):
         chat_id = str(ctx.chat_id)
         u = users.get(chat_id)
         if not u:
-            print("[DEBUG] Пользователь не найден")
+          #  print("[DEBUG] Пользователь не найден")
             return True
 
         is_saved = u.get("editing_existing", False)
@@ -2444,7 +2444,7 @@ def handle_callback(ctx):
        
 # ------------------ Колбек для редактирования даты рождения ------------------
     elif ctx.payload in ("edit_birthdate_save", "edit_birthdate_profile"):
-        print(f"[DEBUG CALLBACK] Нажата кнопка редактирования даты рождения, payload={ctx.payload}")
+     #   print(f"[DEBUG CALLBACK] Нажата кнопка редактирования даты рождения, payload={ctx.payload}")
 
         chat_id = str(ctx.chat_id)
         users.setdefault(chat_id, {"step": None})
@@ -2454,7 +2454,7 @@ def handle_callback(ctx):
         u["is_editing"] = True  # <- важно, чтобы text_steps шёл в handle_profile_edit
         u["editing_existing"] = ctx.payload.endswith("_profile")
 
-        print(f"[DEBUG] Шаг установлен: {u['step']}, редактируем существующую анкету: {u['editing_existing']}")
+      #  print(f"[DEBUG] Шаг установлен: {u['step']}, редактируем существующую анкету: {u['editing_existing']}")
 
         ctx.reply("Введите день рождения (1-31):")  
     
@@ -2465,7 +2465,7 @@ def handle_callback(ctx):
 
 
     elif ctx.payload in ("edit_city_save", "edit_city_profile"):
-        print(f"[DEBUG CALLBACK] Нажата кнопка редактирования города: {ctx.payload}")
+    #    print(f"[DEBUG CALLBACK] Нажата кнопка редактирования города: {ctx.payload}")
 
         u["step"] = "edit_city_search_"
         u["is_editing"] = True
@@ -2491,7 +2491,7 @@ def handle_callback(ctx):
 
 # ------------------ Фото ------------------
     elif ctx.payload in ("edit_photo_save", "edit_photo_profile"):
-        print(f"[DEBUG CALLBACK] Нажата кнопка редактирования фото, payload={ctx.payload}")
+     #   print(f"[DEBUG CALLBACK] Нажата кнопка редактирования фото, payload={ctx.payload}")
 
         chat_id = str(ctx.chat_id)
         users.setdefault(chat_id, {"step": None})
@@ -2501,7 +2501,7 @@ def handle_callback(ctx):
         u["is_editing"] = True
         u["editing_existing"] = ctx.payload.endswith("_profile")
 
-        print(f"[DEBUG] Шаг установлен: {u['step']}, редактируем существующую анкету: {u['editing_existing']}")
+    #    print(f"[DEBUG] Шаг установлен: {u['step']}, редактируем существующую анкету: {u['editing_existing']}")
 
         ctx.reply("Отправьте новое фото:")
 
@@ -2512,6 +2512,13 @@ def handle_callback(ctx):
     # =========================
 
     elif ctx.payload == "open_filters":
+        show_filters(ctx)
+
+    elif ctx.payload == "filters_reset":
+        update_filter(chat_id, "filters_gender", "Любой")
+        update_filter(chat_id, "filters_age_min", 18)
+        update_filter(chat_id, "filters_age_max", 35)
+        update_filter(chat_id, "filters_city", "Любой")
         show_filters(ctx)
 
     elif ctx.payload == "gender_filters":
@@ -2591,21 +2598,20 @@ def handle_callback(ctx):
 
 
 
-
-
     elif ctx.payload == "back_to_menu":
         # Возвращение в главное меню
         u["step"] = None
         text, keyboard = main_menu(get_profile(chat_id), chat_id)
         ctx.reply(text, keyboard=keyboard)
+
     elif ctx.payload == "edit_profile":
         # Переход в режим редактирования профиля
         ctx.reply("Что вы хотите изменить?", keyboard=get_edit_keyboard(is_saved=False))
+
     elif ctx.payload == "edit_profile_after_creation":
         u["step_edit"] = True
         u["step"] = None
         ctx.reply("Что вы хотите изменить?", keyboard=get_edit_keyboard(is_saved=True))
-
 
     elif ctx.payload == "ruletka":
         # Запуск чата-рулетки
@@ -2613,15 +2619,16 @@ def handle_callback(ctx):
             "💬 Чат-рулетка готова. Выберите действие:",
             keyboard=ruletka_keyboard
         )
+
     elif ctx.payload == "roulette_in":
-        asyncio.create_task(roulette_in(ctx))
-
-
+        # Запуск поиска собеседника
+      #  print(f"[CALLBACK] roulette_in: {ctx.chat_id}")
+        roulette_in(ctx)  # синхронный вызов
 
     elif ctx.payload == "roulette_out":
-        asyncio.create_task(roulette_out(str(ctx.chat_id)))
-
-
+        # Выход из чата
+     #   print(f"[CALLBACK] roulette_out: {ctx.chat_id}")
+        roulette_out(str(ctx.chat_id))  # синхронный вызов
 
 
 
@@ -2689,7 +2696,7 @@ def handle_callback(ctx):
         
     # ------------------ Кнопка Готово ------------------
     elif ctx.payload in ("edit_save_profile", "edit_done_create", "open_profile", "cancel_menu_delete"):
-        print(f"[DEBUG CALLBACK] Нажата кнопка Готово, payload={ctx.payload}")
+     #   print(f"[DEBUG CALLBACK] Нажата кнопка Готово, payload={ctx.payload}")
 
         chat_id = str(ctx.chat_id)
         u = users.get(chat_id, {})
@@ -2698,22 +2705,22 @@ def handle_callback(ctx):
 
         # Сохраняем профиль
         save_profile(chat_id, u)
-        print(f"[DEBUG CALLBACK] Профиль сохранён для chat_id={chat_id}")
+    #   print(f"[DEBUG CALLBACK] Профиль сохранён для chat_id={chat_id}")
 
         # Получаем обновлённый профиль
         user_profile = get_profile(chat_id)
-        print(f"[DEBUG CALLBACK] user_profile загружен: {user_profile}")
+    #    print(f"[DEBUG CALLBACK] user_profile загружен: {user_profile}")
 
         # ------------------ Готово 2 ------------------
         if ctx.payload in ("edit_save_profile", "cancel_menu_delete"):
-            print("[DEBUG CALLBACK] Показываем save_menu")
+      #      print("[DEBUG CALLBACK] Показываем save_menu")
             keyboard = save_menu  # если это объект
             # keyboard = save_menu(user_profile)  # если это функция
             show_profile(ctx, user_profile, keyboard)
 
         # ------------------ Готово 1 ------------------
         else:
-            print("[DEBUG CALLBACK] Показываем profile_menu")
+        #    print("[DEBUG CALLBACK] Показываем profile_menu")
             keyboard = profile_menu  # если объект
             # keyboard = profile_menu(user_profile)  # если это функция
             show_profile(ctx, user_profile, keyboard)
@@ -2740,13 +2747,27 @@ def handle_callback(ctx):
 # ================== РУЛЕТКА ==================
 @bot.command("roulette")
 
+def get_filters(user_id):
+    profile = get_profile(user_id)
+    if not profile:
+        return {}
+    return {
+        "city": profile.get("filters_city") or "Любой",
+        "gender": profile.get("filters_gender") or "Любой",
+        "age_min": profile.get("filters_age_min") or 18,
+        "age_max": profile.get("filters_age_max") or 35,
+    }
+
 # ================== ТАЙМЕР ==================
 # ================== ТАЙМЕР ЧАТА ==================
-async def chat_timer(u1, u2):
-    timer_seconds = get_chat_timer()
-    await asyncio.sleep(timer_seconds)
 
-    # Проверка, что чат всё ещё активен
+
+# ================== ЧАТ ТАЙМЕР ==================
+def chat_timer(u1, u2):
+    timer_seconds = get_chat_timer()
+    time.sleep(timer_seconds)  # 🔹 обычная пауза
+
+    # Проверка активного чата
     if active_chats.get(u1) != u2:
         return
 
@@ -2755,17 +2776,14 @@ async def chat_timer(u1, u2):
     if not p1 or not p2:
         return
 
-    # VIP освобождает от таймера
     if is_vip(p1) or is_vip(p2):
         return
 
-    # Закрываем чат
     active_chats.pop(u1, None)
     active_chats.pop(u2, None)
 
     minutes_str = minutes_text(timer_seconds)
 
-    # Сообщения для пользователей
     msg1 = (
         f"⏳ Бесплатные {minutes_str} закончились!\n\n"
         f"💬 {p2.get('name')} всё ещё онлайн...\n"
@@ -2779,48 +2797,38 @@ async def chat_timer(u1, u2):
         f"💎 Активируй VIP и общайся без ограничений:"
     )
 
-    # Исправленный формат клавиатуры (список словарей, не вложенные списки)
     keyboard = InlineKeyboard(
-        [{"text": "💎 Продолжить без ограничений", "callback": "vip"}],  # первая строка
+        [{"text": "💎 Продолжить без ограничений", "callback": "vip"}],
         [
             {"text": "🔄 Найти нового собеседника", "callback": "ruletka"},
             {"text": "📩 Пригласить друга 🎁", "callback": "invite"}
-        ]  # вторая строка с двумя кнопками
-    )
-
-    # Отправка первого сообщения (без ошибок)
-    if u1 in contexts:
-        contexts[u1].reply(msg1)  # 🔹 клавиатуру не прикрепляем
-    if u2 in contexts:
-        contexts[u2].reply(msg2)  # 🔹 клавиатуру не прикрепляем
-
-    # Небольшая пауза перед повторным напоминанием
-    await asyncio.sleep(2)
-
-    # Второе напоминание с клавиатурой
-    reminder1 = (
-        f"🔥 {p2.get('name')} всё ещё онлайн! "
-        f"Активируйте VIP и не упустите разговор!\n"
-    )
-    reminder2 = (
-        f"🔥 {p1.get('name')} всё ещё онлайн! "
-        f"Активируйте VIP и не упустите разговор!\n"
+        ]
     )
 
     if u1 in contexts:
-        contexts[u1].reply(reminder1, keyboard=keyboard)  # 🔹 с клавиатурой
+        contexts[u1].reply(msg1)
     if u2 in contexts:
-        contexts[u2].reply(reminder2, keyboard=keyboard)  # 🔹 с клавиатурой
+        contexts[u2].reply(msg2)
 
+    time.sleep(2)  # 🔹 обычная пауза
 
+    reminder1 = f"🔥 {p2.get('name')} всё ещё онлайн! Активируйте VIP и не упустите разговор!\n"
+    reminder2 = f"🔥 {p1.get('name')} всё ещё онлайн! Активируйте VIP и не упустите разговор!\n"
+
+    if u1 in contexts:
+        contexts[u1].reply(reminder1, keyboard=keyboard)
+    if u2 in contexts:
+        contexts[u2].reply(reminder2, keyboard=keyboard)
 
 # ================== roulette_in ==================
 
-async def roulette_in(ctx):
+
+
+# ================== РУЛЕТКА ПОИСК ==================
+def roulette_in(ctx):
     user_id = str(ctx.chat_id)
-    
-    print(f"[SEARCH START] {user_id}") 
-    
+    print(f"🚀 [SEARCH START] {user_id}")
+
     contexts[user_id] = ctx
     profile = get_profile(user_id)
 
@@ -2830,6 +2838,7 @@ async def roulette_in(ctx):
 
     filters = get_filters(user_id)
     print(f"[USER FILTERS] {user_id}: {filters}")
+
     if not filters or not filters.get("city"):
         ctx.reply("❗ Выберите город в фильтрах")
         return
@@ -2838,145 +2847,105 @@ async def roulette_in(ctx):
         ctx.reply("❗ Вы уже в чате")
         return
 
-    # Добавляем в очередь VIP вперед, обычные — в конец
+    # Добавляем в очередь
     if is_vip(profile):
-        await redis_client.lpush(QUEUE_KEY, user_id)
+        roulette_queue.insert(0, user_id)
+        print(f"[QUEUE] VIP добавлен вперед: {roulette_queue}")
     else:
-        await redis_client.rpush(QUEUE_KEY, user_id)
+        roulette_queue.append(user_id)
+        print(f"[QUEUE] Обычный добавлен в конец: {roulette_queue}")
 
     ctx.reply("🔎 Ищем собеседника...", keyboard=ruletka_keyboard)
 
     # Поиск партнёра
-    while True:
-        if user_id in active_chats:
-            print(f"[STOP SEARCH] {user_id} уже в чате")
-            break
-    
-        if user_id in active_chats:
-            print(f"[STOP SEARCH] {user_id} уже в чате")
-            break
-    
-        candidates = await redis_client.lrange(QUEUE_KEY, 0, -1)
-        partner_id = None
+    partner_id = None
+    for candidate in roulette_queue:
+        if candidate == user_id:
+            continue
 
-        for candidate in candidates:
-            if candidate == user_id:
-                continue
+        partner_profile = get_profile(candidate)
+        partner_filters = get_filters(candidate)
 
-            partner_profile = get_profile(candidate)
-            partner_filters = get_filters(candidate)
+        # ===== Проверка профилей =====
+        if not partner_profile or not partner_filters:
+            print(f"[SKIP] Кандидат {candidate} без профиля или фильтров")
+            continue
 
-            if not partner_profile or not partner_filters:
-                continue
+        # ===== Фильтры города =====
+        if filters["city"] != "Любой" and filters["city"] != partner_profile.get("city"):
+            print(f"❌ My city mismatch: {filters['city']} != {partner_profile.get('city')}")
+            continue
+        if partner_filters["city"] != "Любой" and partner_filters["city"] != profile.get("city"):
+            print(f"❌ Partner city mismatch: {partner_filters['city']} != {profile.get('city')}")
+            continue
 
-            # === Фильтры города и пола ===
-            partner_city_filter = partner_filters.get("city")
-            user_city_filter = filters.get("city")
+        # ===== Фильтры пола =====
+        if filters["gender"] != "Любой" and filters["gender"] != partner_profile.get("gender"):
+            print(f"❌ My gender mismatch: {filters['gender']} != {partner_profile.get('gender')}")
+            continue
+        if partner_filters["gender"] != "Любой" and partner_filters["gender"] != profile.get("gender"):
+            print(f"❌ Partner gender mismatch: {partner_filters['gender']} != {profile.get('gender')}")
+            continue
 
-            if partner_city_filter != "Любой" and partner_city_filter != profile.get("city"):
-                continue
+        # ===== Фильтры возраста =====
+        my_age = profile.get("age", 0)
+        partner_age = partner_profile.get("age", 0)
 
-            if user_city_filter != "Любой" and user_city_filter != partner_profile.get("city"):
-                continue
-            
-            
-            
-            
-            #if partner_filters.get("city") != profile.get("city"):
-            #    continue
-            if partner_filters.get("gender") and partner_filters.get("gender") != "Любой":
-                if profile.get("gender") != partner_filters.get("gender"):
-                    continue
+        if not (filters["age_min"] <= partner_age <= filters["age_max"]):
+            print(f"❌ My age mismatch: {filters['age_min']} <= {partner_age} <= {filters['age_max']}")
+            continue
+        if not (partner_filters["age_min"] <= my_age <= partner_filters["age_max"]):
+            print(f"❌ Partner age mismatch: {partner_filters['age_min']} <= {my_age} <= {partner_filters['age_max']}")
+            continue
 
-            # === Фильтры возраста (двусторонние) ===
-            user_age = profile.get("age", 0)
-            partner_age = partner_profile.get("age", 0)
+        # ===== Подходит =====
+        print(f"✅ CONNECT {user_id} ↔ {candidate}")
+        partner_id = candidate
+        break
 
-            user_age_min = filters.get("age_min", 0)
-            user_age_max = filters.get("age_max", 0)
-            partner_age_min = partner_filters.get("age_min", 0)
-            partner_age_max = partner_filters.get("age_max", 0)
+    if partner_id:
+        # Удаляем из очереди
+        roulette_queue.remove(partner_id)
+        roulette_queue.remove(user_id)
 
-            if not (user_age_min <= partner_age <= user_age_max):
-                continue
-            if not (partner_age_min <= user_age <= partner_age_max):
-                continue
+        # Старт чата
+        start_chat(user_id, partner_id)
 
-            partner_id = candidate
-            break
+        # Показать анкеты
+        leave_keyboard = InlineKeyboard([{"text": "⏹ Выйти из чата", "callback": "leave_chat"}])
+        show_profile(ctx, partner_profile, keyboard=leave_keyboard)
+        show_profile(contexts[partner_id], profile, keyboard=leave_keyboard)
 
-        if partner_id:
-            # Удаляем из очереди
-            await redis_client.lrem(QUEUE_KEY, 0, partner_id)
-            await redis_client.lrem(QUEUE_KEY, 0, user_id)
+        # Запуск таймера в фоне через поток
+        threading.Thread(target=chat_timer, args=(user_id, partner_id), daemon=True).start()
 
-            # === Лог и уведомления ===
-            log.info(f"[Connect] {user_id} ↔ {partner_id}")
-            ctx.reply("✨ Собеседник найден! Начните общение 👋")
-            if partner_id in contexts:
-                contexts[partner_id].reply("✨ Собеседник найден! Начните общение 👋")
-
-            # Получаем профили для анкет
-            user_profile = get_profile(user_id)
-            partner_profile = get_profile(partner_id)
-
-            leave_keyboard = InlineKeyboard(
-                [{"text": "⏹ Выйти из чата", "callback": "leave_chat"}]
-            )
-
-            # Анкета партнёра для пользователя
-            if partner_profile:
-                show_profile(ctx, partner_profile, keyboard=leave_keyboard)
-
-            # Анкета пользователя для партнёра
-            if user_profile and partner_id in contexts:
-                show_profile(contexts[partner_id], user_profile, keyboard=leave_keyboard)
-            # Запускаем чат
-            print(f"[CONNECT] {user_id} ↔ {partner_id}") 
-            await start_chat(user_id, partner_id)
-            # Запускаем таймер в фоне
-            asyncio.create_task(chat_timer(user_id, partner_id))
-            break
-
-        else:
-            # Если очередь пуста, ждём 1 сек
-            await asyncio.sleep(1)
+    else:
+        print(f"[QUEUE] Партнёр не найден, остаётся в очереди: {roulette_queue}")
 
 # ================== ВЫХОД ==================
-async def roulette_out(user_id):
+# ================== ВЫХОД ИЗ ЧАТА ==================
+def roulette_out(user_id):
     partner = active_chats.get(user_id)
-
-    # ===== Если пользователь уже не в чате =====
     if not partner:
         if user_id in contexts:
             profile = get_profile(user_id)
             header_text, keyboard = main_menu(profile, user_id)
-
-            final_text = f"❌ Вы не в чате\n\n{header_text}"
-            contexts[user_id].reply(final_text, keyboard=keyboard)
+            contexts[user_id].reply(f"❌ Вы не в чате\n\n{header_text}", keyboard=keyboard)
         return
 
-    # ===== Удаляем обоих из активных чатов =====
     active_chats.pop(user_id, None)
     active_chats.pop(partner, None)
 
-    # ===== Пользователь =====
     if user_id in contexts:
         profile = get_profile(user_id)
         header_text, keyboard = main_menu(profile, user_id)
+        contexts[user_id].reply(f"❌ Вы вышли из чата\n\n{header_text}", keyboard=keyboard)
 
-        final_text = f"❌ Вы вышли из чата\n\n{header_text}"
-        contexts[user_id].reply(final_text, keyboard=keyboard)
-
-    # ===== Партнёр =====
     if partner in contexts:
         profile = get_profile(partner)
         header_text, keyboard = main_menu(profile, partner)
+        contexts[partner].reply(f"❗ Собеседник вышел из чата\n\n{header_text}", keyboard=keyboard)
 
-        final_text = f"❗ Собеседник вышел из чата\n\n{header_text}"
-        contexts[partner].reply(final_text, keyboard=keyboard)
-
-    # ===== Очистка памяти =====
     contexts.pop(user_id, None)
     contexts.pop(partner, None)
 
