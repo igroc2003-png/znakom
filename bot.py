@@ -1835,98 +1835,60 @@ def is_vip(profile):
     return profile.get("is_vip", False)
 
 
-# =========================
-# Универсальная функция запуска пользователя
-# =========================
-def handle_start(ctx, payload=None):
+@bot.on("bot_started")
+def start(ctx):
     chat_id = str(ctx.chat_id)
+
+    payload = ctx.payload  # inviter_id если пришёл по ссылке
+    if payload is not None:
+        payload = str(payload).strip()
+        if payload == "":
+            payload = None
+
+    print(f"BOT_STARTED: chat_id={chat_id}, payload={payload}")
+
     users.setdefault(chat_id, {"step": None})
 
-    try:
-        # Проверяем, есть ли профиль
-        profile = get_profile(chat_id)
+    profile = get_profile(chat_id)
 
-        if profile:
-            # Если профиль помечен на удаление
-            if profile.get("deleted_at"):
-                ctx.reply(
-                    "⚠️ Ваша анкета помечена на удаление. Восстановить?",
-                    keyboard=restore_keyboard
-                )
-                return
+    # если профиля нет — создаём
+    if not profile:
+        print("Профиля нет, создаём новый")
 
-            # Если профиль существует и активен — показываем главное меню
-            text, keyboard = main_menu(profile, chat_id)
-            ctx.reply(text, keyboard=keyboard)
+        invited_by = None
+        # защита от самореферала и мусора
+        if payload and payload != chat_id:
+            invited_by = payload
+            print(f"Пользователь пришёл по реферальной ссылке от {invited_by}")
 
-        else:
-            # Новый пользователь — создаём профиль
-            invited_by = payload if payload and payload != chat_id else None
+        # создаём профиль (желательно: idempotent / upsert)
+        create_profile(chat_id, invited_by=invited_by)
 
-            if payload == chat_id:
-                logging.warning(
-                    f"Пользователь {chat_id} попытался пригласить сам себя. Игнорируем payload."
-                )
+        # записываем реферала (желательно: idempotent)
+        if invited_by:
+            process_referral(invited_by, chat_id)
+            print(f"Записали в referrals: {invited_by} -> {chat_id}")
 
-            if invited_by:
-                logging.info(f"Пользователь пришёл по реферальной ссылке от {invited_by}")
-
-            # Создаём профиль
-            create_profile(chat_id, invited_by=invited_by)
-
-            # Записываем реферала
-            if invited_by:
-                process_referral(invited_by, chat_id)
-                logging.info(f"Записали в referrals: {invited_by} -> {chat_id}")
-
-            # Первый шаг анкеты для нового пользователя
-            ctx.reply("🔞 Вам есть 18 лет?", keyboard=age_keyboard)
-            logging.info(f"Создан новый профиль для chat_id={chat_id}")
-
-    except Exception as e:
-        # Универсальная обработка ошибок
-        logging.exception(f"Ошибка при старте для chat_id={chat_id}: {e}")
-        ctx.reply("❌ Произошла ошибка. Попробуйте позже.")
-
-
-# =========================
-# Обработчик bot_started
-# =========================
-@bot.on("bot_started")
-def bot_started(ctx):
-    handle_start(ctx, payload=ctx.payload)
-
-
-# =========================
-# Обработчик команды /start
-# =========================
-@bot.command("start")
-def start_command(ctx):
-    handle_start(ctx, payload=ctx.payload)
-
-
-# =========================
-# Фолбэк: текстовое сообщение /start
-# =========================
-@bot.on("message")
-def start_message_fallback(ctx):
-    text = None
-    if ctx.message:
-        text = ctx.message.get("text")
-    elif ctx.body:
-        text = ctx.body.get("text")
-
-    if not text:
+        # первый шаг анкеты
+        users[chat_id]["step"] = "age_18"
+        ctx.reply("🔞 Вам есть 18 лет?", keyboard=age_keyboard)
         return
 
-    text = text.strip()
+    print(f"Профиль найден: {profile.get('user_id')}")
 
-    if text.startswith("/start"):
-        logging.info(f"Fallback /start detected in message: {text}")
-        # Разбираем payload если есть
-        match = re.match(r"^/start(?:=(\d+))?$", text)
-        payload = match.group(1) if match else None
-        handle_start(ctx, payload=payload)
+    # профиль помечен на удаление
+    if profile.get("deleted_at"):
+        ctx.reply("⚠️ Ваша анкета помечена на удаление. Восстановить?", keyboard=restore_keyboard)
+        return
+
+    # если профиль есть — главное меню
+    text, keyboard = main_menu(profile, chat_id)
+    ctx.reply(text, keyboard=keyboard)
+    
+
+
+
+
 
 # ================== ОБРАБОТКА ВВОДА ГОРОДА ==================
 @bot.on("message_created")
