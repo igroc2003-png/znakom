@@ -3,6 +3,7 @@ import logging
 import threading
 import time
 import asyncio
+import re
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
 from datetime import datetime, timedelta
@@ -1834,7 +1835,83 @@ def is_vip(profile):
     return profile.get("is_vip", False)
 
 
+# =========================
+# Универсальная функция запуска пользователя
+# =========================
+def handle_start(ctx, payload=None):
+    chat_id = str(ctx.chat_id)
 
+    users.setdefault(chat_id, {"step": None})
+
+    try:
+        profile = get_profile(chat_id)
+
+        if profile:
+            if profile.get("deleted_at"):
+                ctx.reply("⚠️ Ваша анкета помечена на удаление. Восстановить?", keyboard=restore_keyboard)
+                return
+
+            text, keyboard = main_menu(profile, chat_id)
+            ctx.reply(text, keyboard=keyboard)
+
+        else:
+            invited_by = payload if payload and payload != chat_id else None
+            if payload == chat_id:
+                logging.warning(f"Пользователь {chat_id} попытался пригласить сам себя. Игнорируем payload.")
+            if invited_by:
+                logging.info(f"Пользователь пришёл по реферальной ссылке от {invited_by}")
+
+            create_profile(chat_id, invited_by=invited_by)
+
+            if invited_by:
+                process_referral(invited_by, chat_id)
+                logging.info(f"Записали в referrals: {invited_by} -> {chat_id}")
+
+            ctx.reply("🔞 Вам есть 18 лет?", keyboard=age_keyboard)
+
+    except Exception as e:
+        logging.exception(f"Ошибка при старте для chat_id={chat_id}: {e}")
+        ctx.reply("❌ Произошла ошибка. Попробуйте позже.")
+
+
+# =========================
+# Обработчик bot_started
+# =========================
+@bot.on("bot_started")
+def bot_started(ctx):
+    handle_start(ctx, payload=ctx.payload)
+
+
+# =========================
+# Обработчик команды /start
+# =========================
+@bot.command("start")
+def start_command(ctx):
+    handle_start(ctx, payload=ctx.payload)
+
+
+# =========================
+# Фолбэк: текстовое сообщение /start
+# =========================
+@bot.on("message")
+def start_message_fallback(ctx):
+    text = None
+    if ctx.message:
+        text = ctx.message.get("text")
+    elif ctx.body:
+        text = ctx.body.get("text")
+
+    if not text:
+        return
+
+    text = text.strip()
+
+    if text.startswith("/start"):
+        logging.info(f"Fallback /start detected in message: {text}")
+        # Разбираем payload если есть
+        match = re.match(r"^/start(?:=(\d+))?$", text)
+        payload = match.group(1) if match else None
+        handle_start(ctx, payload=payload)
 
 # ================== ОБРАБОТКА ВВОДА ГОРОДА ==================
 @bot.on("message_created")
@@ -1998,49 +2075,7 @@ def handle_timer_input(ctx):
 
 
 
-# ================== СТАРТ ==================
-
-@bot.on("bot_started")
-def start(ctx):
-    chat_id = str(ctx.chat_id)
-    payload = ctx.payload  # inviter_id если пришёл по ссылке
-    print(f"BOT_STARTED: chat_id={chat_id}, payload={payload}")
-
-    users.setdefault(chat_id, {"step": None})
-
-    # проверяем, есть ли профиль
-    profile = get_profile(chat_id)
-    if profile:
-        print(f"Профиль найден: {profile['user_id']}")
-    else:
-        print("Профиля нет, создаём новый")
-
-        invited_by = None
-        if payload and payload != chat_id:
-            invited_by = payload
-            print(f"Пользователь пришёл по реферальной ссылке от {invited_by}")
-
-        # создаём профиль
-        create_profile(chat_id, invited_by=invited_by)
-
-        # записываем реферала
-        if invited_by:
-            process_referral(invited_by, chat_id)
-            print(f"Записали в referrals: {invited_by} -> {chat_id}")
-
-        # первый шаг анкеты
-        ctx.reply("🔞 Вам есть 18 лет?", keyboard=age_keyboard)
-        return
-
-    # профиль помечен на удаление
-    if profile.get("deleted_at"):
-        ctx.reply("⚠️ Ваша анкета помечена на удаление. Восстановить?", keyboard=restore_keyboard)
-        return
-
-    # если профиль есть — главное меню
-    text, keyboard = main_menu(get_profile(chat_id), chat_id)
-    ctx.reply(text, keyboard=keyboard)
-    
+ 
    
 
 
@@ -2822,7 +2857,12 @@ def chat_timer(u1, u2):
 
 # ================== roulette_in ==================
 
-
+# ====== Определяем функцию перед использованием ======
+def normalize_city(city):
+    """Удаляет область в скобках и лишние пробелы"""
+    if not city:
+        return ""
+    return re.sub(r"\s*\(.*?\)", "", city).strip()
 
 # ================== РУЛЕТКА ПОИСК ==================
 def roulette_in(ctx):
@@ -2872,13 +2912,19 @@ def roulette_in(ctx):
             continue
 
         # ===== Фильтры города =====
-        if filters["city"] != "Любой" and filters["city"] != partner_profile.get("city"):
+        user_city = normalize_city(filters["city"])
+        partner_city = normalize_city(partner_profile.get("city"))
+
+        if user_city != "Любой" and user_city != partner_city:
             print(f"❌ My city mismatch: {filters['city']} != {partner_profile.get('city')}")
             continue
-        if partner_filters["city"] != "Любой" and partner_filters["city"] != profile.get("city"):
+
+        partner_city_filter = normalize_city(partner_filters["city"])
+        profile_city = normalize_city(profile.get("city"))
+
+        if partner_city_filter != "Любой" and partner_city_filter != profile_city:
             print(f"❌ Partner city mismatch: {partner_filters['city']} != {profile.get('city')}")
             continue
-
         # ===== Фильтры пола =====
         if filters["gender"] != "Любой" and filters["gender"] != partner_profile.get("gender"):
             print(f"❌ My gender mismatch: {filters['gender']} != {partner_profile.get('gender')}")
@@ -2912,7 +2958,7 @@ def roulette_in(ctx):
         start_chat(user_id, partner_id)
 
         # Показать анкеты
-        leave_keyboard = InlineKeyboard([{"text": "⏹ Выйти из чата", "callback": "leave_chat"}])
+        leave_keyboard = InlineKeyboard([{"text": "⏹ Выйти из чата", "callback": "roulette_out"}])
         show_profile(ctx, partner_profile, keyboard=leave_keyboard)
         show_profile(contexts[partner_id], profile, keyboard=leave_keyboard)
 
