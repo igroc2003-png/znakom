@@ -1835,57 +1835,68 @@ def is_vip(profile):
     return profile.get("is_vip", False)
 
 
+users = {}
+
+
+# ==================== Старт ====================
+
+def common_start_handler(ctx):
+      chat_id = str(ctx.chat_id)
+      payload = ctx.payload    # inviter_id если пришел по ссылке
+      if payload is not None:
+          payload = str(payload).strip()
+          if payload == "":
+              payload = None
+
+      print(f"BOT_STARTED: chat_id={chat_id}, payload={payload}")
+
+      users.setdefault(chat_id, {"step": None})
+
+      profile = get_profile(chat_id)
+
+      # если профиля нет — создаём
+      if not profile:
+          print("Профиля нет, создаём новый")
+
+          invited_by = None
+          # защита от самореферала и мусора
+          if payload and payload != chat_id:
+              invited_by = payload
+              print(f"Пользователь пришёл по реферальной ссылке от {invited_by}")
+
+          # создаём профиль (желательно: idempotent / upsert)
+          create_profile(chat_id, invited_by=invited_by)
+
+          # записываем реферала (желательно: idempotent)
+          if invited_by:
+              process_referral(invited_by, chat_id)
+              print(f"Записали в referrals: {invited_by} -> {chat_id}")
+
+          # первый шаг анкеты
+          users[chat_id]["step"] = "age_18"
+          ctx.reply("🔞 Вам есть 18 лет?", keyboard=age_keyboard)
+          return
+
+      print(f"Профиль найден: {profile.get('user_id')}")
+
+      # профиль помечен на удаление
+      if profile.get("deleted_at"):
+          ctx.reply("⚠️ Ваша анкета помечена на удаление. Восстановить?", keyboard=restore_keyboard)
+          return
+
+      # если профиль есть — главное меню
+      text, keyboard = main_menu(profile, chat_id)
+      ctx.reply(text, keyboard=keyboard)
+
+# Обрабатываем событие bot_started
 @bot.on("bot_started")
-def start(ctx):
-    chat_id = str(ctx.chat_id)
+def on_bot_started(ctx):
+      common_start_handler(ctx)
 
-    payload = ctx.payload  # inviter_id если пришёл по ссылке
-    if payload is not None:
-        payload = str(payload).strip()
-        if payload == "":
-            payload = None
-
-    print(f"BOT_STARTED: chat_id={chat_id}, payload={payload}")
-
-    users.setdefault(chat_id, {"step": None})
-
-    profile = get_profile(chat_id)
-
-    # если профиля нет — создаём
-    if not profile:
-        print("Профиля нет, создаём новый")
-
-        invited_by = None
-        # защита от самореферала и мусора
-        if payload and payload != chat_id:
-            invited_by = payload
-            print(f"Пользователь пришёл по реферальной ссылке от {invited_by}")
-
-        # создаём профиль (желательно: idempotent / upsert)
-        create_profile(chat_id, invited_by=invited_by)
-
-        # записываем реферала (желательно: idempotent)
-        if invited_by:
-            process_referral(invited_by, chat_id)
-            print(f"Записали в referrals: {invited_by} -> {chat_id}")
-
-        # первый шаг анкеты
-        users[chat_id]["step"] = "age_18"
-        ctx.reply("🔞 Вам есть 18 лет?", keyboard=age_keyboard)
-        return
-
-    print(f"Профиль найден: {profile.get('user_id')}")
-
-    # профиль помечен на удаление
-    if profile.get("deleted_at"):
-        ctx.reply("⚠️ Ваша анкета помечена на удаление. Восстановить?", keyboard=restore_keyboard)
-        return
-
-    # если профиль есть — главное меню
-    text, keyboard = main_menu(profile, chat_id)
-    ctx.reply(text, keyboard=keyboard)
-    
-
+# Обрабатываем команду /start
+@bot.command("start")
+def command_start(ctx):
+      common_start_handler(ctx)
 
 
 
