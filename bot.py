@@ -1840,36 +1840,51 @@ def is_vip(profile):
 # =========================
 def handle_start(ctx, payload=None):
     chat_id = str(ctx.chat_id)
-
     users.setdefault(chat_id, {"step": None})
 
     try:
+        # Проверяем, есть ли профиль
         profile = get_profile(chat_id)
 
         if profile:
+            # Если профиль помечен на удаление
             if profile.get("deleted_at"):
-                ctx.reply("⚠️ Ваша анкета помечена на удаление. Восстановить?", keyboard=restore_keyboard)
+                ctx.reply(
+                    "⚠️ Ваша анкета помечена на удаление. Восстановить?",
+                    keyboard=restore_keyboard
+                )
                 return
 
+            # Если профиль существует и активен — показываем главное меню
             text, keyboard = main_menu(profile, chat_id)
             ctx.reply(text, keyboard=keyboard)
 
         else:
+            # Новый пользователь — создаём профиль
             invited_by = payload if payload and payload != chat_id else None
+
             if payload == chat_id:
-                logging.warning(f"Пользователь {chat_id} попытался пригласить сам себя. Игнорируем payload.")
+                logging.warning(
+                    f"Пользователь {chat_id} попытался пригласить сам себя. Игнорируем payload."
+                )
+
             if invited_by:
                 logging.info(f"Пользователь пришёл по реферальной ссылке от {invited_by}")
 
+            # Создаём профиль
             create_profile(chat_id, invited_by=invited_by)
 
+            # Записываем реферала
             if invited_by:
                 process_referral(invited_by, chat_id)
                 logging.info(f"Записали в referrals: {invited_by} -> {chat_id}")
 
+            # Первый шаг анкеты для нового пользователя
             ctx.reply("🔞 Вам есть 18 лет?", keyboard=age_keyboard)
+            logging.info(f"Создан новый профиль для chat_id={chat_id}")
 
     except Exception as e:
+        # Универсальная обработка ошибок
         logging.exception(f"Ошибка при старте для chat_id={chat_id}: {e}")
         ctx.reply("❌ Произошла ошибка. Попробуйте позже.")
 
