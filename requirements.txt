@@ -1,4 +1,0 @@
-maxgram==0.1.4
-flask
-yookassa
-redis>=5.3.0
