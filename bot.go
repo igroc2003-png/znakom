@@ -1248,7 +1248,7 @@ func main() {
     initDB()
     startAutoDelete()
 
-    token := os.Getenv("BOT_TOKEN")
+    token := "f9LHodD0cOJifvwS05WVOZ0E3rbxxlLRTt5JcHdB2ezESF1dp1N4jaNe9S5_UeZYXBcqF9KC5H8JfaUDfpeg"
     if token == "" {
         panic("BOT_TOKEN не установлен")
     }
